@@ -17,7 +17,7 @@ type Shipment struct {
 	Status      string  `json:"status"`
 }
 
-func main() {
+func setupRouter() *gin.Engine {
 	router := gin.Default()
 
 	shipments := make(map[string]Shipment)
@@ -67,7 +67,12 @@ func main() {
 		c.JSON(http.StatusOK, shipment)
 	})
 
-	router.Run(":8080")
+	return router
+}
+
+func main() {
+	router := setupRouter()
+	router.Run(":8080")	
 }
 
 
