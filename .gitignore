@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 
 coverage.out
+
+# Private docs
+docs/private-docs/
