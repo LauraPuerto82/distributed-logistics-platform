@@ -2,15 +2,34 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
+// FakeEventPublisher captures published events and can simulate failures
+// without requiring a running Kafka broker.
+type FakeEventPublisher struct {
+	PublishedEvents []ShipmentCreatedEvent
+	Err             error
+}
+
+func (p *FakeEventPublisher) PublishShipmentCreated(event ShipmentCreatedEvent) error {
+	if p.Err != nil {
+		return p.Err
+	}
+
+	p.PublishedEvents = append(p.PublishedEvents, event)
+
+	return nil
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	store := NewInMemoryShipmentStore()
-    router := setupRouter(store)
+	publisher := &NoOpEventPublisher{}
+	router := setupRouter(store, publisher)
 
 	response := httptest.NewRecorder()
 
@@ -47,7 +66,8 @@ func TestHealthEndpoint(t *testing.T) {
 
 func TestCreateShipment(t *testing.T) {
 	store := NewInMemoryShipmentStore()
-    router := setupRouter(store)
+	publisher := &FakeEventPublisher{}
+	router := setupRouter(store, publisher)
 
 	requestBody := `{
 		"origin": "Madrid",
@@ -106,6 +126,66 @@ func TestCreateShipment(t *testing.T) {
 	if shipment.ID == "" {
 		t.Errorf("expected shipment ID to be generated")
 	}
+
+	if len(publisher.PublishedEvents) != 1 {
+		t.Fatalf(
+			"expected 1 published event, got %d",
+			len(publisher.PublishedEvents),
+		)
+	}
+
+	event := publisher.PublishedEvents[0]
+
+	if event.EventType != "ShipmentCreated" {
+		t.Errorf(
+			"expected event type ShipmentCreated, got %s",
+			event.EventType,
+		)
+	}
+
+	if event.EventID == "" {
+		t.Errorf("expected event ID to be generated")
+	}
+
+	if event.ShipmentID != shipment.ID {
+		t.Errorf(
+			"expected event shipment ID %s, got %s",
+			shipment.ID,
+			event.ShipmentID,
+		)
+	}
+
+	if event.Payload.Origin != shipment.Origin {
+		t.Errorf(
+			"expected event origin %s, got %s",
+			shipment.Origin,
+			event.Payload.Origin,
+		)
+	}
+
+	if event.Payload.Destination != shipment.Destination {
+		t.Errorf(
+			"expected event destination %s, got %s",
+			shipment.Destination,
+			event.Payload.Destination,
+		)
+	}
+
+	if event.Payload.Weight != shipment.Weight {
+		t.Errorf(
+			"expected event weight %f, got %f",
+			shipment.Weight,
+			event.Payload.Weight,
+		)
+	}
+
+	if event.Payload.Priority != shipment.Priority {
+		t.Errorf(
+			"expected event priority %s, got %s",
+			shipment.Priority,
+			event.Payload.Priority,
+		)
+	}
 }
 
 func TestCreateShipmentValidation(t *testing.T) {
@@ -161,7 +241,8 @@ func TestCreateShipmentValidation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := NewInMemoryShipmentStore()
-            router := setupRouter(store)
+			publisher := &NoOpEventPublisher{}
+			router := setupRouter(store, publisher)
 
 			request, _ := http.NewRequest(
 				http.MethodPost,
@@ -188,7 +269,8 @@ func TestCreateShipmentValidation(t *testing.T) {
 
 func TestGetShipment(t *testing.T) {
 	store := NewInMemoryShipmentStore()
-    router := setupRouter(store)
+	publisher := &NoOpEventPublisher{}
+	router := setupRouter(store, publisher)
 
 	requestBody := `{
 		"origin": "Madrid",
@@ -197,7 +279,6 @@ func TestGetShipment(t *testing.T) {
 		"priority": "HIGH"
 	}`
 
-	// Primero creamos un shipment
 	createRequest, _ := http.NewRequest(
 		http.MethodPost,
 		"/shipments",
@@ -224,7 +305,6 @@ func TestGetShipment(t *testing.T) {
 		t.Fatalf("failed to parse created shipment: %v", err)
 	}
 
-	// Ahora recuperamos ese mismo shipment
 	getRequest, _ := http.NewRequest(
 		http.MethodGet,
 		"/shipments/"+createdShipment.ID,
@@ -261,7 +341,8 @@ func TestGetShipment(t *testing.T) {
 
 func TestGetShipmentNotFound(t *testing.T) {
 	store := NewInMemoryShipmentStore()
-    router := setupRouter(store)
+	publisher := &NoOpEventPublisher{}
+	router := setupRouter(store, publisher)
 
 	request, _ := http.NewRequest(
 		http.MethodGet,
@@ -278,6 +359,59 @@ func TestGetShipmentNotFound(t *testing.T) {
 			"expected status %d, got %d",
 			http.StatusNotFound,
 			response.Code,
+		)
+	}
+}
+
+// Verifies the current MVP behavior for a partial failure:
+// the shipment remains stored when event publication fails, while the API returns 500.
+func TestCreateShipmentReturns500WhenEventPublishFails(t *testing.T) {
+	store := NewInMemoryShipmentStore()
+
+	publisher := &FakeEventPublisher{
+		Err: errors.New("kafka unavailable"),
+	}
+
+	router := setupRouter(store, publisher)
+
+	requestBody := `{
+		"origin": "Zaragoza",
+		"destination": "Bilbao",
+		"weight": 20,
+		"priority": "MEDIUM"
+	}`
+
+	request, _ := http.NewRequest(
+		http.MethodPost,
+		"/shipments",
+		strings.NewReader(requestBody),
+	)
+
+	request.Header.Set("Content-Type", "application/json")
+
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Errorf(
+			"expected status %d, got %d",
+			http.StatusInternalServerError,
+			response.Code,
+		)
+	}
+
+	if len(store.shipments) != 1 {
+		t.Errorf(
+			"expected shipment to remain persisted after publish failure, got %d shipments",
+			len(store.shipments),
+		)
+	}
+
+	if len(publisher.PublishedEvents) != 0 {
+		t.Errorf(
+			"expected no successfully published events, got %d",
+			len(publisher.PublishedEvents),
 		)
 	}
 }
