@@ -9,7 +9,8 @@ import (
 )
 
 func TestHealthEndpoint(t *testing.T) {
-	router := setupRouter()
+	store := NewInMemoryShipmentStore()
+    router := setupRouter(store)
 
 	response := httptest.NewRecorder()
 
@@ -45,7 +46,8 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestCreateShipment(t *testing.T) {
-	router := setupRouter()
+	store := NewInMemoryShipmentStore()
+    router := setupRouter(store)
 
 	requestBody := `{
 		"origin": "Madrid",
@@ -158,7 +160,8 @@ func TestCreateShipmentValidation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			router := setupRouter()
+			store := NewInMemoryShipmentStore()
+            router := setupRouter(store)
 
 			request, _ := http.NewRequest(
 				http.MethodPost,
@@ -184,7 +187,8 @@ func TestCreateShipmentValidation(t *testing.T) {
 }
 
 func TestGetShipment(t *testing.T) {
-	router := setupRouter()
+	store := NewInMemoryShipmentStore()
+    router := setupRouter(store)
 
 	requestBody := `{
 		"origin": "Madrid",
@@ -256,7 +260,8 @@ func TestGetShipment(t *testing.T) {
 }
 
 func TestGetShipmentNotFound(t *testing.T) {
-	router := setupRouter()
+	store := NewInMemoryShipmentStore()
+    router := setupRouter(store)
 
 	request, _ := http.NewRequest(
 		http.MethodGet,
