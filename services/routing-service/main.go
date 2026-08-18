@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"math"
+
+	"github.com/segmentio/kafka-go"
 )
 
 type ShipmentCreatedPayload struct {
@@ -161,13 +165,50 @@ func main() {
 	fmt.Println("Routing Service starting...")
 
 	graph := buildGraph()
+	_ = graph
 
-	path, distance, err := shortestPath(graph, "Madrid", "Bilbao")
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{"localhost:9092"},
+		Topic:   "shipment-events",
+		GroupID: "routing-service",
+	})
+
+	defer reader.Close()
+
+	for {
+		message, err := reader.ReadMessage(context.Background())
+		if err != nil {
+			fmt.Println("Error reading message:", err)
+			continue
+		}
+
+		var event ShipmentCreatedEvent
+
+		if err := json.Unmarshal(message.Value, &event); err != nil {
+			fmt.Println("Error decoding event:", err)
+			continue
+		}
+
+		path, distance, err := shortestPath(
+			graph,
+			event.Payload.Origin,
+			event.Payload.Destination,
+		)
+		
+		if err != nil {
+			fmt.Printf(
+				"Failed to calculate route for shipment %s: %v\n",
+				event.ShipmentID,
+				err,
+			)
+			continue
+		}
+
+		fmt.Printf(
+			"Route calculated for shipment %s: %v (%.0f km)\n",
+			event.ShipmentID,
+			path,
+			distance,
+		)
 	}
-
-	fmt.Println("Path:", path)
-	fmt.Println("Distance:", distance)
 }
