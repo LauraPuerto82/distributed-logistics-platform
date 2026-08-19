@@ -1,9 +1,26 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 )
+
+// FakeEventPublisher captures published events and can simulate
+// infrastructure failures without requiring a running Kafka broker.
+type FakeEventPublisher struct {
+	PublishedEvents []RouteCalculatedEvent
+	Err             error
+}
+
+func (p *FakeEventPublisher) PublishRouteCalculated(event RouteCalculatedEvent) error {
+	if p.Err != nil {
+		return p.Err
+	}
+
+	p.PublishedEvents = append(p.PublishedEvents, event)
+	return nil
+}
 
 func TestShortestPathMadridToBilbao(t *testing.T) {
 	graph := buildGraph()
@@ -49,7 +66,7 @@ func TestShortestPathSameOriginAndDestination(t *testing.T) {
 
 	if distance != 0 {
 		t.Errorf("expected distance 0, got %.0f", distance)
-	}	
+	}
 }
 
 func TestShortestPathOriginDoesNotExist(t *testing.T) {
@@ -81,6 +98,104 @@ func TestShortestPathNoRouteExists(t *testing.T) {
 	graph["Bilbao"] = []Edge{}
 
 	_, _, err := shortestPath(graph, "Madrid", "Bilbao")
+
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+}
+
+func TestProcessShipmentPublishesRouteCalculated(t *testing.T) {
+	graph := buildGraph()
+	publisher := &FakeEventPublisher{}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_input",
+		EventType:  "ShipmentCreated",
+		ShipmentID: "shp_test_1",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	err := processShipment(graph, event, publisher)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(publisher.PublishedEvents) != 1 {
+		t.Fatalf(
+			"expected 1 published event, got %d",
+			len(publisher.PublishedEvents),
+		)
+	}
+
+	routeEvent := publisher.PublishedEvents[0]
+
+	if routeEvent.EventType != "RouteCalculated" {
+		t.Errorf(
+			"expected event type RouteCalculated, got %s",
+			routeEvent.EventType,
+		)
+	}
+
+	if routeEvent.EventID == "" {
+		t.Errorf("expected event ID to be generated")
+	}
+
+	if routeEvent.ShipmentID != event.ShipmentID {
+		t.Errorf(
+			"expected shipment ID %s, got %s",
+			event.ShipmentID,
+			routeEvent.ShipmentID,
+		)
+	}
+
+	expectedPath := []string{
+		"Madrid",
+		"Zaragoza",
+		"Logroño",
+		"Bilbao",
+	}
+
+	if !reflect.DeepEqual(routeEvent.Payload.Path, expectedPath) {
+		t.Errorf(
+			"expected path %v, got %v",
+			expectedPath,
+			routeEvent.Payload.Path,
+		)
+	}
+
+	if routeEvent.Payload.DistanceKM != 640 {
+		t.Errorf(
+			"expected distance 640, got %.0f",
+			routeEvent.Payload.DistanceKM,
+		)
+	}
+}
+
+func TestProcessShipmentReturnsErrorWhenPublisherFails(t *testing.T) {
+	graph := buildGraph()
+
+	publisher := &FakeEventPublisher{
+		Err: errors.New("kafka unavailable"),
+	}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_input",
+		EventType:  "ShipmentCreated",
+		ShipmentID: "shp_test_1",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	err := processShipment(graph, event, publisher)
 
 	if err == nil {
 		t.Fatal("expected an error, got nil")
