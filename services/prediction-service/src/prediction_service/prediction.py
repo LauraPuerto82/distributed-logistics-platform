@@ -6,7 +6,10 @@ from prediction_service.models import (
     ETAPredictedPayload,
     RouteCalculatedEvent,
 )
+from prediction_service.publisher import EventPublisher
 
+# MVP baseline: estimate travel time using an 80 km/h average speed
+# plus a 15% buffer for expected operational delays.
 AVERAGE_SPEED_KMH = 80
 BUFFER_FACTOR = 1.15
 
@@ -36,3 +39,13 @@ def process_route_calculated(
             estimated_travel_minutes=estimated_minutes
         ),
     )
+
+def handle_route_calculated(
+    event: RouteCalculatedEvent,
+    publisher: EventPublisher,
+) -> ETAPredictedEvent:
+    eta_event = process_route_calculated(event)
+
+    publisher.publish_eta_predicted(eta_event)
+
+    return eta_event

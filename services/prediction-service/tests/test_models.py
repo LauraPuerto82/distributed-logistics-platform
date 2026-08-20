@@ -1,7 +1,10 @@
-import pytest
 from datetime import datetime
-from prediction_service.models import RouteCalculatedEvent
+
+import pytest
 from pydantic import ValidationError
+
+from prediction_service.models import RouteCalculatedEvent
+
 
 
 def test_route_calculated_event_parses_valid_data():
