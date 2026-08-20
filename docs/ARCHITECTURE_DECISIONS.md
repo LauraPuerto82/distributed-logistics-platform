@@ -249,6 +249,11 @@ type EventPublisher interface {
 
 Production uses `KafkaEventPublisher`; tests use a NoOp/Fake publisher.
 
+The same pattern is now used by Routing Service for `RouteCalculated`
+publication. Routing depends on the publication capability through its
+own `EventPublisher`, allowing route processing to be tested with a
+`FakeEventPublisher` without a running Kafka broker.
+
 ### Trade-off
 
 The interface adds another abstraction, accepted because event
@@ -477,6 +482,123 @@ an unknown defect.
 
 ------------------------------------------------------------------------
 
+## ADR-009 --- Use a dedicated consumer group for Routing Service
+
+**Status:** Accepted\
+**Stage:** Routing Service Kafka integration
+
+### Context
+
+Routing Service is the first real Kafka consumer in the platform. It
+consumes `ShipmentCreated` events from `shipment-events` and must be
+able to resume consumption across service restarts.
+
+Kafka consumer groups also provide the mechanism for distributing
+partitions between multiple instances of the same logical consumer.
+
+### Decision
+
+Routing Service consumes events using:
+
+``` text
+GroupID = routing-service
+```
+
+Kafka therefore tracks committed offsets for this consumer group and can
+resume consumption from its recorded progress.
+
+If multiple Routing Service instances use the same group, Kafka can
+distribute topic partitions between those instances rather than
+delivering every event to every instance.
+
+### Trade-off
+
+Consumer-group offset tracking provides consumption progress and work
+distribution, but it does not make event processing idempotent.
+
+An event may still be delivered more than once around failures or offset
+commits, so consumers must eventually tolerate duplicate delivery.
+
+### Alternatives considered
+
+-   Consume without a consumer group and manage offsets directly.
+-   Give every Routing Service instance a different group ID, causing
+    each instance to receive its own copy of the event stream.
+
+### Consequences
+
+The logical Routing Service consumer has a stable identity and
+Kafka-managed progress.
+
+Consumer idempotency remains a separate reliability concern.
+
+------------------------------------------------------------------------
+
+## ADR-010 --- Use a shared `shipment-events` topic for the MVP
+
+**Status:** Accepted for MVP\
+**Stage:** Routing Service Kafka integration
+
+### Context
+
+The shipment lifecycle now contains multiple event types:
+
+``` text
+ShipmentCreated
+RouteCalculated
+```
+
+Additional shipment-related events such as `ETAPredicted` are expected
+later.
+
+The platform could use a separate Kafka topic for each event type or
+keep related shipment lifecycle events in a shared topic.
+
+### Decision
+
+For the current MVP, publish shipment lifecycle events to:
+
+``` text
+shipment-events
+```
+
+Routing Service consumes this topic and processes only events whose
+`event_type` is `ShipmentCreated`.
+
+Other event types, including the `RouteCalculated` events published by
+Routing Service itself, are ignored by that consumer.
+
+Shipment-related messages continue to use `shipment_id` as the Kafka
+message key.
+
+### Trade-off
+
+A shared topic keeps the initial Kafka topology simple and groups
+related shipment lifecycle events together.
+
+In return, consumers receive event types they may not handle and must
+inspect `event_type` before processing a message.
+
+As the number of event types, consumers, or operational requirements
+grows, separate topics may provide clearer ownership and independent
+retention, scaling, or access policies.
+
+### Alternatives considered
+
+-   Create a dedicated topic for each event type.
+-   Create separate topics for each producing service.
+
+### Consequences
+
+The current event flow can evolve without adding a new Kafka topic for
+every step.
+
+The topic strategy should be revisited if concrete scaling, ownership,
+retention, or operational requirements make the shared topic a
+limitation.
+
+------------------------------------------------------------------------
+
 # Known Technical Debt
 
 ## TD-001 --- Non-atomic PostgreSQL + Kafka writes
@@ -521,13 +643,16 @@ introduced.
 **Priority:** High
 
 **Current limitation:**\
-Consumers do not yet track which events they have already processed.
+Routing Service is now a real Kafka consumer, but it does not persist
+which events it has already processed.
 
-When real consumers are introduced, duplicate delivery could therefore
-produce duplicate side effects.
+If a `ShipmentCreated` event is delivered more than once, Routing
+Service may process it again and publish duplicate `RouteCalculated`
+events.
 
 **Planned evolution:**\
-Use `event_id` to detect events that have already been processed.
+Use `event_id` to detect events that have already been processed and
+make consumer side effects safe under duplicate delivery.
 
 ------------------------------------------------------------------------
 
@@ -607,6 +732,28 @@ consumers make it necessary.
 
 ------------------------------------------------------------------------
 
+## TD-009 --- Consumer offset commit semantics are not explicitly controlled
+
+**Area:** Event processing reliability\
+**Priority:** High
+
+**Current limitation:**\
+Routing Service currently relies on the Kafka client consumer-group
+behavior for offset management. The application has not yet defined an
+explicit policy for when a consumed `ShipmentCreated` event should be
+considered successfully processed relative to publishing
+`RouteCalculated`.
+
+A failure around event processing, publication, and offset commit can
+lead to redelivery or other ambiguous processing outcomes.
+
+**Planned evolution:**\
+Define explicit consumer processing and offset-commit semantics together
+with retry and idempotency behavior, so failures during
+`RouteCalculated` publication can be handled safely.
+
+------------------------------------------------------------------------
+
 # Deferred Decisions
 
 These topics are intentionally **not decided yet** because the system
@@ -620,11 +767,6 @@ downstream services process events. A generic update API or state
 machine has not been introduced yet because no current service requires
 it.
 
-## Kafka consumer groups
-
-Consumer group configuration will be decided when the first real Kafka
-consumer is implemented.
-
 ## Retry and dead-letter strategy
 
 Retries, backoff, and dead-letter handling will be designed after the
@@ -635,13 +777,6 @@ first consumer provides a concrete failure model.
 Logging, correlation IDs, metrics, and tracing will evolve when
 requests/events begin crossing multiple running services and local logs
 are no longer sufficient.
-
-## Topic strategy
-
-The MVP currently uses `shipment-events`. The decision to retain a
-shared event topic or split event types across topics will be revisited
-when multiple producers/consumers create concrete operational
-requirements.
 
 ------------------------------------------------------------------------
 
