@@ -2,7 +2,7 @@
 
 An event-driven logistics platform built incrementally to explore realistic distributed-system design, failure modes, and reliability patterns.
 
-The platform currently accepts shipment requests through a Go service, persists them in PostgreSQL, and publishes `ShipmentCreated` events to Kafka. The Routing Service consumes those events, calculates the shortest route, and publishes `RouteCalculated` events for downstream services.
+The platform currently accepts shipment requests through a Go service, persists them in PostgreSQL, and publishes `ShipmentCreated` events to Kafka. The Routing Service consumes those events, calculates the shortest route, and publishes `RouteCalculated`. The Python Prediction Service consumes the calculated route, estimates travel time using an explicit MVP baseline, and publishes `ETAPredicted` back to Kafka.
 
 ## 🏗️ Architecture
 
@@ -28,7 +28,10 @@ PostgreSQL   Kafka
                |
                v
        Prediction Service
-             planned
+               |
+               | ETAPredicted
+               v
+             Kafka
 ```
 
 ### Current flow
@@ -41,19 +44,25 @@ POST /shipments
 → Routing Service consumes ShipmentCreated
 → calculate shortest route
 → publish RouteCalculated to Kafka
+→ Prediction Service consumes RouteCalculated
+→ validate the event contract with Pydantic
+→ estimate travel time
+→ publish ETAPredicted to Kafka
 ```
 
 ## 🛠️ Tech Stack
 
 | Area | Technology |
 | --- | --- |
-| Services | Go |
+| Services | Go, Python 3.12 |
+| Python project/dependency management | uv |
+| Python validation | Pydantic |
 | HTTP API | Gin |
 | Database | PostgreSQL 17 |
 | Database driver | pgx |
 | Event streaming | Apache Kafka |
 | Infrastructure | Docker Compose |
-| Testing | Go testing / httptest |
+| Testing | Go testing / httptest / pytest |
 
 ## 🔌 API
 
@@ -81,6 +90,8 @@ A successful creation persists the shipment and publishes a `ShipmentCreated` ev
 ### Prerequisites
 
 - Go
+- Python 3.12+
+- uv
 - Docker
 - Docker Compose
 
@@ -141,6 +152,29 @@ go run .
 
 The service consumes `ShipmentCreated` events, calculates the shortest route using Dijkstra's algorithm, and publishes a `RouteCalculated` event back to Kafka.
 
+### 6. Configure Prediction Service
+
+The Prediction Service consumes `RouteCalculated` events and publishes `ETAPredicted` events through the same Kafka topic.
+
+PowerShell:
+
+```powershell
+$env:KAFKA_BROKER="localhost:9092"
+$env:KAFKA_TOPIC="shipment-events"
+```
+
+### 7. Run Prediction Service
+
+Open another terminal:
+
+```bash
+cd services/prediction-service
+uv sync
+uv run prediction-service
+```
+
+The service validates incoming `RouteCalculated` events with Pydantic, estimates travel time using the current MVP baseline, and publishes an `ETAPredicted` event back to Kafka.
+
 ## 🧪 Testing
 
 Run each service's tests independently.
@@ -159,6 +193,13 @@ cd services/routing-service
 go test -v
 ```
 
+Prediction Service:
+
+```bash
+cd services/prediction-service
+uv run pytest -v
+```
+
 Tests are designed to run without PostgreSQL or Kafka where possible. Infrastructure dependencies are abstracted behind interfaces and replaced with in-memory or fake implementations during tests.
 
 | Production | Tests |
@@ -167,6 +208,8 @@ Tests are designed to run without PostgreSQL or Kafka where possible. Infrastruc
 | `KafkaEventPublisher` | `FakeEventPublisher` |
 
 Routing Service follows the same approach through `EventPublisher`, allowing route calculation and event publication behavior to be tested with a `FakeEventPublisher` without a running Kafka broker.
+
+Prediction Service follows the same approach through a Python `EventPublisher` protocol, allowing ETA calculation and event publication behavior to be tested with a `FakeEventPublisher` without a running Kafka broker.
 
 ## 📍 Current Status
 
@@ -181,12 +224,15 @@ Routing Service follows the same approach through `EventPublisher`, allowing rou
 | `ShipmentCreated` consumption | Implemented |
 | `RouteCalculated` publication | Implemented |
 | Infrastructure-independent behavior tests | Implemented |
-| Prediction Service | Next |
+| Prediction Service | Implemented |
+| `RouteCalculated` consumption | Implemented |
+| ETA baseline prediction | Implemented |
+| `ETAPredicted` publication | Implemented |
 | Consumer idempotency and reliability patterns | Planned |
 
 ## 🗺️ Roadmap
 
-The next milestone is to extend the asynchronous flow with ETA prediction:
+The asynchronous MVP flow is now implemented end to end:
 
 ```text
 Order Service
@@ -197,9 +243,10 @@ Order Service
 → Kafka
 → Prediction Service
 → ETAPredicted
+→ Kafka
 ```
 
-The Order → Routing portion of this flow is already implemented.
+The Order → Routing → Prediction flow is implemented. The next reliability milestone is to define explicit consumer offset-commit semantics, retries, and idempotent processing.
 
 ## Architecture Decisions
 
