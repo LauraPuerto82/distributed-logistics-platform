@@ -548,8 +548,13 @@ ShipmentCreated
 RouteCalculated
 ```
 
-Additional shipment-related events such as `ETAPredicted` are expected
-later.
+Prediction Service now adds a third shipment lifecycle event:
+
+```text
+ETAPredicted
+```
+
+All three event types currently share the same topic.
 
 The platform could use a separate Kafka topic for each event type or
 keep related shipment lifecycle events in a shared topic.
@@ -565,8 +570,11 @@ shipment-events
 Routing Service consumes this topic and processes only events whose
 `event_type` is `ShipmentCreated`.
 
-Other event types, including the `RouteCalculated` events published by
-Routing Service itself, are ignored by that consumer.
+Prediction Service consumes the same topic through its own consumer group
+and processes only events whose `event_type` is `RouteCalculated`.
+
+Other event types, including events published by each service itself, are
+ignored by consumers that do not handle them.
 
 Shipment-related messages continue to use `shipment_id` as the Kafka
 message key.
@@ -596,6 +604,215 @@ every step.
 The topic strategy should be revisited if concrete scaling, ownership,
 retention, or operational requirements make the shared topic a
 limitation.
+
+------------------------------------------------------------------------
+
+
+## ADR-011 --- Implement Prediction Service in Python with `uv`
+
+**Status:** Accepted\
+**Stage:** Prediction Service baseline
+
+### Context
+
+The first two services are implemented in Go. Prediction Service introduces
+a workload expected to evolve toward applied AI/ML capabilities.
+
+### Decision
+
+Implement Prediction Service in Python 3.12 and manage its project
+environment and locked dependencies with `uv`.
+
+### Trade-off
+
+The platform becomes polyglot, adding language-specific tooling and
+dependency-management concerns.
+
+That cost is accepted because Python provides a natural path for prediction
+and future AI/ML capabilities while service boundaries remain explicit.
+
+### Consequences
+
+Each service owns its runtime and dependencies. Kafka event contracts remain
+the integration boundary between Go and Python services.
+
+------------------------------------------------------------------------
+
+## ADR-012 --- Start ETA prediction with an explicit heuristic baseline
+
+**Status:** Accepted for MVP\
+**Stage:** Prediction Service baseline
+
+### Context
+
+Prediction Service needs to produce a useful ETA before historical or
+real-time data exists to justify a trained predictive model.
+
+Introducing ML without suitable data would add complexity without evidence
+that the model is meaningful.
+
+### Decision
+
+Use a deterministic MVP baseline:
+
+```text
+average speed = 80 km/h
+operational buffer = 15%
+estimated minutes = (distance / average speed) × buffer × 60
+```
+
+The baseline is intentionally described as a heuristic rather than as
+machine learning.
+
+### Trade-off
+
+The estimate does not yet account for road type, traffic, construction,
+vehicle condition, mandatory driver rest, meal stops, weather, or other
+real-world factors.
+
+### Planned evolution
+
+Replace or enrich the baseline when suitable data and requirements justify
+a more realistic predictive approach.
+
+------------------------------------------------------------------------
+
+## ADR-013 --- Validate Prediction Service event contracts with Pydantic
+
+**Status:** Accepted\
+**Stage:** Prediction Service baseline
+
+### Context
+
+Prediction Service receives JSON produced by another independently running
+service. Invalid event types or impossible values should be rejected at the
+service boundary rather than silently entering prediction logic.
+
+### Decision
+
+Represent `RouteCalculated` and `ETAPredicted` contracts as Pydantic models.
+
+Current examples include:
+
+```text
+RouteCalculated.event_type == "RouteCalculated"
+distance_km >= 0
+ETAPredicted.event_type == "ETAPredicted"
+estimated_travel_minutes >= 0
+```
+
+### Trade-off
+
+The Python service maintains its own representation of event contracts, so
+cross-language schema drift remains possible until explicit schema
+governance is introduced.
+
+### Consequences
+
+Parsing and validation are explicit, typed, and independently testable.
+
+------------------------------------------------------------------------
+
+## ADR-014 --- Give Prediction Service an independent consumer group and replay history on first start
+
+**Status:** Accepted for MVP\
+**Stage:** Prediction Service Kafka integration
+
+### Context
+
+Prediction Service must consume `RouteCalculated` independently from
+Routing Service. When introduced into an existing development topic, route
+events may already exist before the new consumer group has committed an
+offset.
+
+### Decision
+
+Use:
+
+```text
+group.id = prediction-service
+auto.offset.reset = earliest
+```
+
+`earliest` applies only when the consumer group has no committed offset.
+After progress has been committed, normal restarts resume from the group's
+recorded position rather than replaying the entire topic.
+
+### Trade-off
+
+A newly created consumer group may process retained historical events. This
+is appropriate for the current service but would need to be reconsidered
+for consumers whose side effects should apply only to new events.
+
+### Consequences
+
+Routing Service and Prediction Service consume the shared stream
+independently and Kafka tracks their progress separately.
+
+------------------------------------------------------------------------
+
+## ADR-015 --- Keep Prediction Service event publication behind an `EventPublisher` protocol
+
+**Status:** Accepted\
+**Stage:** Prediction Service Kafka publication
+
+### Context
+
+Calling `confluent-kafka` directly from prediction logic would couple core
+behavior to Kafka and make behavior tests depend on a running broker.
+
+### Decision
+
+Define the publication capability through a Python `Protocol`.
+Production uses `KafkaEventPublisher`; tests use a `FakeEventPublisher`.
+
+### Trade-off
+
+This introduces an additional abstraction for a small service.
+
+The abstraction is accepted because Kafka is an external infrastructure
+boundary and the fake allows both successful publication and publication
+failure behavior to be tested deterministically.
+
+### Consequences
+
+ETA calculation and orchestration can be tested without Kafka, while the
+production implementation remains replaceable.
+
+------------------------------------------------------------------------
+
+## ADR-016 --- Flush each `ETAPredicted` publication synchronously for the MVP
+
+**Status:** Accepted for MVP\
+**Stage:** Prediction Service Kafka publication
+
+### Context
+
+`confluent-kafka` producers enqueue messages asynchronously. Calling
+`produce()` alone does not mean all pending producer messages have completed
+delivery before the application continues.
+
+### Decision
+
+Call `flush()` after each `ETAPredicted` publication.
+
+For the current MVP, predictable and easy-to-reason-about delivery behavior
+is preferred over maximum producer throughput.
+
+### Trade-off
+
+Flushing after every event introduces synchronous waiting and prevents the
+producer from taking full advantage of batching and asynchronous throughput.
+
+This decision does not provide exactly-once processing and does not solve
+the coordination between downstream publication and the consumed event's
+offset commit.
+
+### Planned evolution
+
+If throughput becomes relevant, use asynchronous delivery callbacks and
+batching or controlled flushing while defining explicit failure and
+shutdown semantics.
 
 ------------------------------------------------------------------------
 
@@ -643,12 +860,12 @@ introduced.
 **Priority:** High
 
 **Current limitation:**\
-Routing Service is now a real Kafka consumer, but it does not persist
-which events it has already processed.
+Routing Service and Prediction Service are now real Kafka consumers, but
+neither currently persists which events it has already processed.
 
-If a `ShipmentCreated` event is delivered more than once, Routing
-Service may process it again and publish duplicate `RouteCalculated`
-events.
+If an input event is delivered more than once, the corresponding service
+may process it again and publish a duplicate downstream event
+(`RouteCalculated` or `ETAPredicted`).
 
 **Planned evolution:**\
 Use `event_id` to detect events that have already been processed and
@@ -738,11 +955,11 @@ consumers make it necessary.
 **Priority:** High
 
 **Current limitation:**\
-Routing Service currently relies on the Kafka client consumer-group
-behavior for offset management. The application has not yet defined an
-explicit policy for when a consumed `ShipmentCreated` event should be
-considered successfully processed relative to publishing
-`RouteCalculated`.
+Routing Service and Prediction Service currently rely on their Kafka
+clients' consumer-group behavior for offset management. The application
+has not yet defined an explicit policy for when a consumed event should
+be considered successfully processed relative to publishing its
+downstream event.
 
 A failure around event processing, publication, and offset commit can
 lead to redelivery or other ambiguous processing outcomes.
@@ -750,7 +967,27 @@ lead to redelivery or other ambiguous processing outcomes.
 **Planned evolution:**\
 Define explicit consumer processing and offset-commit semantics together
 with retry and idempotency behavior, so failures during
-`RouteCalculated` publication can be handled safely.
+`RouteCalculated` or `ETAPredicted` publication can be handled safely.
+
+------------------------------------------------------------------------
+
+
+## TD-010 --- Prediction producer flushes synchronously per event
+
+**Area:** Messaging throughput\
+**Priority:** Low
+
+**Current limitation:**\
+Prediction Service calls `flush()` after every `ETAPredicted` publication.
+This keeps MVP delivery behavior simple but adds synchronous waiting and
+limits producer throughput.
+
+**Planned evolution:**\
+If throughput requirements justify it, move to asynchronous delivery
+callbacks and batching or controlled flushing while preserving explicit
+error handling.
+
+**Related decision:** ADR-016
 
 ------------------------------------------------------------------------
 
