@@ -2,7 +2,7 @@
 
 An event-driven logistics platform built incrementally to explore realistic distributed-system design, failure modes, and reliability patterns.
 
-The platform currently accepts shipment requests through a Go service, persists them in PostgreSQL, and publishes `ShipmentCreated` events to Kafka. The Routing Service consumes those events, calculates the shortest route, and publishes `RouteCalculated`. The Python Prediction Service consumes the calculated route, estimates travel time using an explicit MVP baseline, and publishes `ETAPredicted` back to Kafka.
+The platform currently accepts shipment requests through a Go service, persists them in PostgreSQL, and publishes `ShipmentCreated` events to Kafka. The Routing Service consumes those events idempotently, calculates the shortest route, and reliably publishes `RouteCalculated` through a transactional outbox. The Python Prediction Service consumes the calculated route, estimates travel time using an explicit MVP baseline, and publishes `ETAPredicted` back to Kafka.
 
 ## 🏗️ Architecture
 
@@ -17,21 +17,32 @@ Order Service (Go)
       |      \
       v       v
 PostgreSQL   Kafka
-               |
-               | ShipmentCreated
-               v
+              |
+              | ShipmentCreated
+              v
         Routing Service
-               |
-               | RouteCalculated
-               v
-             Kafka
-               |
-               v
-       Prediction Service
-               |
-               | ETAPredicted
-               v
-             Kafka
+              |
+              | processed event +
+              | outbox event
+              v
+         PostgreSQL
+        /          \
+processed_events  outbox_events
+                       |
+                       | pending RouteCalculated
+                       v
+                Outbox Publisher
+                       |
+                       v
+                     Kafka
+                       |
+                       | RouteCalculated
+                       v
+              Prediction Service
+                       |
+                       | ETAPredicted
+                       v
+                     Kafka
 ```
 
 ### Current flow
@@ -42,8 +53,12 @@ POST /shipments
 → persist shipment in PostgreSQL
 → publish ShipmentCreated to Kafka
 → Routing Service consumes ShipmentCreated
+→ check whether the event was already processed
 → calculate shortest route
+→ atomically persist processed event + RouteCalculated outbox event
+→ Outbox Publisher reads pending events
 → publish RouteCalculated to Kafka
+→ mark outbox event as published
 → Prediction Service consumes RouteCalculated
 → validate the event contract with Pydantic
 → estimate travel time
@@ -132,11 +147,12 @@ The API runs on `http://localhost:8080`.
 
 ### 4. Configure Routing Service
 
-The Routing Service consumes and publishes events through the same Kafka topic.
+The Routing Service uses PostgreSQL to persist processed event IDs and transactional outbox events, and Kafka to consume and publish domain events.
 
 PowerShell:
 
 ```powershell
+$env:DATABASE_URL="postgres://logistics:logistics@localhost:5434/logistics"
 $env:KAFKA_BROKER="localhost:9092"
 $env:KAFKA_TOPIC="shipment-events"
 ```
@@ -150,7 +166,7 @@ cd services/routing-service
 go run .
 ```
 
-The service consumes `ShipmentCreated` events, calculates the shortest route using Dijkstra's algorithm, and publishes a `RouteCalculated` event back to Kafka.
+The service consumes `ShipmentCreated` events idempotently, calculates the shortest route using Dijkstra's algorithm, and stores the resulting `RouteCalculated` event in a transactional outbox. A background outbox publisher then publishes pending events to Kafka and marks them as published after successful delivery.
 
 ### 6. Configure Prediction Service
 
@@ -190,7 +206,12 @@ Routing Service:
 
 ```bash
 cd services/routing-service
+
+# Unit tests
 go test -v
+
+# Integration tests (requires PostgreSQL)
+go test -tags=integration -v
 ```
 
 Prediction Service:
@@ -200,14 +221,18 @@ cd services/prediction-service
 uv run pytest -v
 ```
 
-Tests are designed to run without PostgreSQL or Kafka where possible. Infrastructure dependencies are abstracted behind interfaces and replaced with in-memory or fake implementations during tests.
+Tests are designed to run without PostgreSQL or Kafka where possible. Infrastructure dependencies are abstracted behind interfaces and replaced with in-memory or fake implementations during unit tests.
 
 | Production | Tests |
 | --- | --- |
 | `PostgresShipmentStore` | `InMemoryShipmentStore` |
 | `KafkaEventPublisher` | `FakeEventPublisher` |
+| `PostgresProcessedEventStore` | `FakeProcessedEventStore` |
+| `PostgresProcessedEventStore` (`OutboxStore`) | `FakeOutboxStore` |
 
-Routing Service follows the same approach through `EventPublisher`, allowing route calculation and event publication behavior to be tested with a `FakeEventPublisher` without a running Kafka broker.
+Routing Service separates event-processing, outbox persistence, and event-publication behavior behind `ProcessedEventStore`, `OutboxStore`, and `EventPublisher`. Unit tests use fakes to verify idempotent processing, outbox event creation, publication, and at-least-once retry behavior without requiring PostgreSQL or Kafka.
+
+PostgreSQL-specific outbox behavior is covered separately by integration tests using the `integration` build tag.
 
 Prediction Service follows the same approach through a Python `EventPublisher` protocol, allowing ETA calculation and event publication behavior to be tested with a `FakeEventPublisher` without a running Kafka broker.
 
@@ -222,13 +247,16 @@ Prediction Service follows the same approach through a Python `EventPublisher` p
 | Routing Service | Implemented |
 | Shortest-path routing (Dijkstra) | Implemented |
 | `ShipmentCreated` consumption | Implemented |
+| Routing consumer idempotency | Implemented |
+| Routing transactional outbox | Implemented |
 | `RouteCalculated` publication | Implemented |
+| Routing PostgreSQL integration tests | Implemented |
 | Infrastructure-independent behavior tests | Implemented |
 | Prediction Service | Implemented |
 | `RouteCalculated` consumption | Implemented |
 | ETA baseline prediction | Implemented |
 | `ETAPredicted` publication | Implemented |
-| Consumer idempotency and reliability patterns | Planned |
+| Prediction consumer idempotency and reliability | Planned |
 
 ## 🗺️ Roadmap
 
@@ -239,6 +267,7 @@ Order Service
 → ShipmentCreated
 → Kafka
 → Routing Service
+→ transactional outbox
 → RouteCalculated
 → Kafka
 → Prediction Service
@@ -246,10 +275,12 @@ Order Service
 → Kafka
 ```
 
-The Order → Routing → Prediction flow is implemented. The next reliability milestone is to define explicit consumer offset-commit semantics, retries, and idempotent processing.
+The Order → Routing → Prediction flow is implemented. Routing now provides persistent consumer idempotency and transactional outbox publication with at-least-once delivery semantics.
+
+The next reliability milestone is to extend idempotent processing and reliable event publication to the Prediction Service, then define explicit Kafka offset-commit and retry semantics across consumers.
 
 ## Architecture Decisions
 
 Architecture decisions, trade-offs, known technical debt, and intentionally deferred improvements are documented separately in [`docs/ARCHITECTURE_DECISIONS.md`](docs/ARCHITECTURE_DECISIONS.md).
 
-This includes the current non-atomic PostgreSQL/Kafka write, which has been deliberately reproduced as a real failure scenario and is tracked there rather than duplicated in this README.
+This includes reliability trade-offs around PostgreSQL/Kafka coordination, transactional outbox delivery, consumer idempotency, and intentionally accepted at-least-once delivery semantics.
