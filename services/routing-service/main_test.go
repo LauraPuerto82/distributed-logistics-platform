@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 // FakeEventPublisher captures published events and can simulate
@@ -107,6 +108,7 @@ func TestShortestPathNoRouteExists(t *testing.T) {
 func TestProcessShipmentPublishesRouteCalculated(t *testing.T) {
 	graph := buildGraph()
 	publisher := &FakeEventPublisher{}
+	processedEventStore := NewInMemoryProcessedEventStore()
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_input",
@@ -120,7 +122,12 @@ func TestProcessShipmentPublishesRouteCalculated(t *testing.T) {
 		},
 	}
 
-	err := processShipment(graph, event, publisher)
+	err := processShipment(
+		graph,
+		event,
+		publisher,
+		processedEventStore,
+	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -183,6 +190,8 @@ func TestProcessShipmentReturnsErrorWhenPublisherFails(t *testing.T) {
 		Err: errors.New("kafka unavailable"),
 	}
 
+	processedEventStore := NewInMemoryProcessedEventStore()
+
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_input",
 		EventType:  "ShipmentCreated",
@@ -195,9 +204,48 @@ func TestProcessShipmentReturnsErrorWhenPublisherFails(t *testing.T) {
 		},
 	}
 
-	err := processShipment(graph, event, publisher)
+	err := processShipment(
+		graph,
+		event,
+		publisher,
+		processedEventStore,
+	)
 
 	if err == nil {
 		t.Fatal("expected an error, got nil")
+	}
+}
+
+func TestProcessShipmentDoesNotPublishDuplicateEvent(t *testing.T) {
+	graph := buildGraph()
+	publisher := &FakeEventPublisher{}
+	processedEventStore := NewInMemoryProcessedEventStore()
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt-123",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp-123",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	if err := processShipment(graph, event, publisher, processedEventStore); err != nil {
+		t.Fatalf("first processing failed: %v", err)
+	}
+
+	if err := processShipment(graph, event, publisher, processedEventStore); err != nil {
+		t.Fatalf("second processing failed: %v", err)
+	}
+
+	if len(publisher.PublishedEvents) != 1 {
+		t.Fatalf(
+			"expected 1 published event, got %d",
+			len(publisher.PublishedEvents),
+		)
 	}
 }

@@ -84,6 +84,31 @@ func (p *KafkaEventPublisher) Close() error {
 	return p.writer.Close()
 }
 
+type ProcessedEventStore interface {
+    IsProcessed(eventID string) (bool, error)
+    MarkProcessed(eventID string) error
+}
+
+type InMemoryProcessedEventStore struct {
+	processed map[string]struct{}
+}
+
+func NewInMemoryProcessedEventStore() *InMemoryProcessedEventStore {
+	return &InMemoryProcessedEventStore{
+		processed: make(map[string]struct{}),
+	}
+}
+
+func (s *InMemoryProcessedEventStore) IsProcessed(eventID string) (bool, error) {
+	_, exists := s.processed[eventID]
+	return exists, nil
+}
+
+func (s *InMemoryProcessedEventStore) MarkProcessed(eventID string) error {
+	s.processed[eventID] = struct{}{}
+	return nil
+}
+
 type Edge struct {
 	To         string
 	DistanceKM float64
@@ -221,7 +246,17 @@ func processShipment(
 	graph Graph,
 	event ShipmentCreatedEvent,
 	publisher EventPublisher,
+	processedEventStore ProcessedEventStore,
 ) error {
+	isProcessed, err := processedEventStore.IsProcessed(event.EventID)
+	if err != nil {
+		return err
+	}
+
+	if isProcessed {
+		return nil
+	}
+
 	path, distance, err := shortestPath(
 		graph,
 		event.Payload.Origin,
@@ -243,6 +278,10 @@ func processShipment(
 	}
 
 	if err := publisher.PublishRouteCalculated(routeEvent); err != nil {
+		return err
+	}
+
+	if err := processedEventStore.MarkProcessed(event.EventID); err != nil {
 		return err
 	}
 
@@ -279,6 +318,8 @@ func main() {
 
 	defer publisher.Close()
 
+	processedEventStore := NewInMemoryProcessedEventStore()
+
 	for {
 		message, err := reader.ReadMessage(context.Background())
 		if err != nil {
@@ -298,7 +339,12 @@ func main() {
 			continue
 		}
 
-		if err := processShipment(graph, event, publisher); err != nil {
+		if err := processShipment(
+			graph,
+			event,
+			publisher,
+			processedEventStore,
+		); err != nil {
 			fmt.Printf(
 				"Failed to process shipment %s: %v\n",
 				event.ShipmentID,
