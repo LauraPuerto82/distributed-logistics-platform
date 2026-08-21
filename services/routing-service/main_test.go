@@ -49,6 +49,7 @@ func (s *FakeProcessedEventStore) MarkProcessedWithOutboxEvent(
 type FakeOutboxStore struct {
 	PendingEvents []RouteCalculatedEvent
 	PublishedIDs  []string
+	MarkErr       error
 }
 
 func (s *FakeOutboxStore) GetPendingEvents() ([]RouteCalculatedEvent, error) {
@@ -56,6 +57,10 @@ func (s *FakeOutboxStore) GetPendingEvents() ([]RouteCalculatedEvent, error) {
 }
 
 func (s *FakeOutboxStore) MarkPublished(eventID string) error {
+	if s.MarkErr != nil {
+		return s.MarkErr
+	}
+
 	s.PublishedIDs = append(s.PublishedIDs, eventID)
 	return nil
 }
@@ -329,5 +334,52 @@ func TestPublishPendingEventsPublishesOutboxEvents(t *testing.T) {
 			"expected event ID evt-outbox-1 to be marked published, got %s",
 			outboxStore.PublishedIDs[0],
 		)
+	}
+}
+
+func TestPublishPendingEventsCanRepublishWhenMarkPublishedFails(t *testing.T) {
+	event := RouteCalculatedEvent{
+		EventID:    "evt-outbox-1",
+		EventType:  "RouteCalculated",
+		ShipmentID: "shp-123",
+	}
+
+	outboxStore := &FakeOutboxStore{
+		PendingEvents: []RouteCalculatedEvent{event},
+		MarkErr:       errors.New("database unavailable"),
+	}
+
+	publisher := &FakeEventPublisher{}
+
+	// Kafka publication succeeds, but marking the event as published fails.
+	err := publishPendingEvents(outboxStore, publisher)
+	if err == nil {
+		t.Fatal("expected first publishing attempt to fail")
+	}
+
+	if len(publisher.PublishedEvents) != 1 {
+		t.Fatalf(
+			"expected 1 published event, got %d",
+			len(publisher.PublishedEvents),
+		)
+	}
+
+	// Simulate PostgreSQL being available again.
+	outboxStore.MarkErr = nil
+
+	err = publishPendingEvents(outboxStore, publisher)
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got %v", err)
+	}
+
+	if len(publisher.PublishedEvents) != 2 {
+		t.Fatalf(
+			"expected duplicate publication, got %d published events",
+			len(publisher.PublishedEvents),
+		)
+	}
+
+	if publisher.PublishedEvents[0].EventID != publisher.PublishedEvents[1].EventID {
+		t.Fatal("expected the retry to publish the same event ID")
 	}
 }
