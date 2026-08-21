@@ -249,10 +249,14 @@ type EventPublisher interface {
 
 Production uses `KafkaEventPublisher`; tests use a NoOp/Fake publisher.
 
-The same pattern is now used by Routing Service for `RouteCalculated`
-publication. Routing depends on the publication capability through its
-own `EventPublisher`, allowing route processing to be tested with a
-`FakeEventPublisher` without a running Kafka broker.
+The same abstraction is also used by Routing Service for Kafka publication.
+Routing's outbox publisher depends on its own `EventPublisher`, allowing
+outbox publication behavior to be tested with a `FakeEventPublisher`
+without a running Kafka broker.
+
+Route processing itself no longer publishes directly through this interface.
+It persists the resulting event in a transactional outbox, which is published
+separately.
 
 ### Trade-off
 
@@ -816,6 +820,243 @@ shutdown semantics.
 
 ------------------------------------------------------------------------
 
+## ADR-017 --- Persist Routing Service consumer idempotency in PostgreSQL
+
+**Status:** Accepted\
+**Stage:** Routing Service reliability
+
+### Context
+
+Kafka consumers may receive the same event more than once around failures,
+restarts, retries, or offset commits.
+
+Routing Service therefore cannot assume that each `ShipmentCreated` event is
+delivered exactly once. Reprocessing the same event could repeat route
+calculation and create duplicate downstream effects.
+
+An in-memory record of processed event IDs would prevent duplicates only while
+a single process remains alive and would be lost on restart.
+
+### Decision
+
+Persist processed input `event_id` values in PostgreSQL.
+
+Routing Service checks whether an event has already been processed before
+performing its business logic. Successfully processed input events are recorded
+in `routing.processed_events`.
+
+The persistence capability is exposed through `ProcessedEventStore`, allowing
+unit tests to use in-memory or fake implementations while production uses
+PostgreSQL.
+
+### Trade-off
+
+Every handled event requires additional database interaction and persistent
+idempotency state must be retained and managed.
+
+That cost is accepted because duplicate delivery is a normal possibility in an
+at-least-once event-driven system and idempotency must survive service restarts.
+
+### Alternatives considered
+
+-   Track processed IDs only in memory.
+-   Assume Kafka consumer-group offsets prevent duplicate delivery.
+-   Allow duplicate processing and rely entirely on downstream consumers.
+
+### Consequences
+
+Routing Service can safely receive the same `ShipmentCreated.event_id` more
+than once without repeating the route-processing side effect.
+
+This does not prevent Kafka from delivering duplicates and does not by itself
+solve reliable downstream publication.
+
+------------------------------------------------------------------------
+
+## ADR-018 --- Use a Transactional Outbox for Routing Service downstream events
+
+**Status:** Accepted\
+**Stage:** Routing Service reliability
+
+### Context
+
+Routing Service originally performed two independent operations after
+calculating a route:
+
+``` text
+1. Publish RouteCalculated to Kafka.
+2. Mark ShipmentCreated as processed in PostgreSQL.
+```
+
+These operations cannot participate in a shared atomic transaction.
+
+A failure after Kafka accepted `RouteCalculated` but before PostgreSQL recorded
+the input event as processed could cause the same `ShipmentCreated` to be
+processed again and another downstream event to be published.
+
+Reversing the order would create the opposite risk: PostgreSQL could record the
+input event as processed before Kafka publication succeeded, causing the
+downstream event to be lost.
+
+### Decision
+
+Use a Transactional Outbox in Routing Service.
+
+Within one PostgreSQL transaction, Routing Service:
+
+``` text
+INSERT processed input event
+INSERT RouteCalculated outbox event
+COMMIT
+```
+
+The resulting `RouteCalculated` event is not published directly from
+`processShipment`.
+
+A separate outbox publisher later reads unpublished rows from
+`routing.outbox_events` and publishes them to Kafka.
+
+### Trade-off
+
+The design introduces additional persistence, an outbox table, a background
+publisher, and eventual rather than immediate Kafka publication.
+
+In return, successful route processing and the durable intent to publish its
+result are committed atomically in PostgreSQL.
+
+### Alternatives considered
+
+-   Publish to Kafka and then mark the input event as processed.
+-   Mark the input event as processed and then publish to Kafka.
+-   Attempt compensation after a partial failure.
+-   Use distributed transactions across PostgreSQL and Kafka.
+
+### Consequences
+
+A committed Routing Service operation cannot lose its `RouteCalculated` event
+solely because Kafka is temporarily unavailable. The event remains durably
+pending in the outbox and can be retried later.
+
+The Transactional Outbox does not provide exactly-once delivery. Publication
+and marking the outbox row as published still cross the PostgreSQL/Kafka
+boundary and therefore have their own failure window.
+
+------------------------------------------------------------------------
+
+## ADR-019 --- Publish Routing outbox events sequentially on a five-second polling interval for the MVP
+
+**Status:** Accepted for MVP\
+**Stage:** Routing Service outbox publication
+
+### Context
+
+Once `RouteCalculated` events are stored in the transactional outbox, a
+separate mechanism is required to discover pending events and publish them to
+Kafka.
+
+The MVP does not currently require high publication throughput or complex
+worker coordination. Predictable behavior and easy debugging are more valuable
+at this stage.
+
+### Decision
+
+Run the Routing Service outbox publisher independently from the Kafka consumer
+loop.
+
+For the current MVP, the publisher polls PostgreSQL every five seconds and
+processes pending outbox events sequentially.
+
+For each event it:
+
+``` text
+read pending outbox event
+publish RouteCalculated to Kafka
+mark the outbox event as published
+```
+
+The event is marked as published only after Kafka publication reports success.
+
+### Trade-off
+
+Polling introduces publication latency of up to approximately one polling
+interval and repeated database queries even when no events are pending.
+
+Sequential publication is easier to reason about and debug but does not make
+full use of batching or parallel throughput.
+
+### Planned evolution
+
+If throughput or latency requirements justify it, evaluate shorter or adaptive
+polling, batching, parallel workers, notifications, or a dedicated outbox
+publisher process while preserving the same reliability semantics.
+
+### Consequences
+
+Outbox publication progresses independently of new `ShipmentCreated` messages.
+A pending event can therefore be published after a restart even when the Kafka
+consumer loop receives no new work.
+
+------------------------------------------------------------------------
+
+## ADR-020 --- Accept at-least-once outbox publication and require idempotent consumers
+
+**Status:** Accepted\
+**Stage:** Routing Service outbox publication
+
+### Context
+
+Even with a Transactional Outbox, Kafka publication and updating
+`outbox_events.published_at` are separate operations across two systems.
+
+The following failure remains possible:
+
+``` text
+Kafka publish                  SUCCESS
+Mark outbox event published   FAILURE
+```
+
+In that case the event has reached Kafka but still appears pending in
+PostgreSQL. A later retry can publish the same outbox event again.
+
+### Decision
+
+Accept at-least-once publication semantics for outbox events.
+
+Retries reuse the same persisted event, including the same `event_id`, rather
+than generating a new event identity.
+
+Downstream consumers must use `event_id`-based idempotency so repeated delivery
+of the same event does not repeat business side effects.
+
+For the MVP, preventing event loss is prioritized over attempting to guarantee
+exactly-once delivery across PostgreSQL and Kafka.
+
+### Trade-off
+
+Duplicate Kafka records are possible around failures between successful
+publication and `published_at` persistence.
+
+Consumers therefore carry additional responsibility and persistent idempotency
+state is required where duplicate side effects would be unsafe.
+
+### Alternatives considered
+
+-   Mark an outbox event as published before sending it to Kafka, which could
+    lose the event if publication then fails.
+-   Attempt to provide exactly-once behavior through application-level timing
+    assumptions.
+-   Introduce stronger distributed transaction infrastructure for the MVP.
+
+### Consequences
+
+The system prefers possible duplicate delivery to silent event loss.
+
+Routing Service already applies persistent idempotency to `ShipmentCreated`.
+The same principle must be extended to Prediction Service when its reliability
+work is implemented.
+
+------------------------------------------------------------------------
+
 # Known Technical Debt
 
 ## TD-001 --- Non-atomic PostgreSQL + Kafka writes
@@ -854,22 +1095,28 @@ introduced.
 
 ------------------------------------------------------------------------
 
-## TD-003 --- Consumers are not yet idempotent
+## TD-003 --- Prediction Service consumer is not yet idempotent
 
 **Area:** Event processing\
 **Priority:** High
 
 **Current limitation:**\
-Routing Service and Prediction Service are now real Kafka consumers, but
-neither currently persists which events it has already processed.
+Routing Service now persists processed `ShipmentCreated.event_id` values in
+PostgreSQL and ignores duplicate deliveries across restarts.
 
-If an input event is delivered more than once, the corresponding service
-may process it again and publish a duplicate downstream event
-(`RouteCalculated` or `ETAPredicted`).
+Prediction Service does not yet persist which `RouteCalculated` events it has
+processed. If the same input event is delivered more than once, Prediction may
+process it again and publish a duplicate `ETAPredicted` event.
+
+This is especially relevant because Routing's transactional outbox deliberately
+uses at-least-once publication semantics and may republish the same
+`RouteCalculated.event_id` around failures.
 
 **Planned evolution:**\
-Use `event_id` to detect events that have already been processed and
-make consumer side effects safe under duplicate delivery.
+Extend persistent `event_id`-based idempotency to Prediction Service and make
+its downstream side effects safe under duplicate delivery.
+
+**Related decisions:** ADR-017, ADR-020
 
 ------------------------------------------------------------------------
 
@@ -920,17 +1167,23 @@ Introduce versioned database migrations when the schema starts evolving.
 
 ------------------------------------------------------------------------
 
-## TD-007 --- Infrastructure integration tests are still missing
+## TD-007 --- Infrastructure integration test coverage is incomplete
 
 **Area:** Testing\
 **Priority:** Medium
 
 **Current limitation:**\
-HTTP behavior tests intentionally use test doubles, so they do not
-verify the real PostgreSQL and Kafka integrations.
+Routing Service now has PostgreSQL integration tests for outbox persistence and
+retrieval behavior, while unit tests continue to isolate infrastructure through
+interfaces and fakes.
+
+Integration coverage is still incomplete across the platform. In particular,
+real Kafka boundaries and other PostgreSQL-backed behavior are not yet covered
+systematically by dedicated integration tests.
 
 **Planned evolution:**\
-Add dedicated integration tests for infrastructure boundaries.
+Expand dedicated integration tests incrementally around infrastructure
+boundaries as their failure semantics become important.
 
 ------------------------------------------------------------------------
 
@@ -1006,8 +1259,8 @@ it.
 
 ## Retry and dead-letter strategy
 
-Retries, backoff, and dead-letter handling will be designed after the
-first consumer provides a concrete failure model.
+Retries, backoff, and dead-letter handling will be designed as consumer
+failure and redelivery semantics are made explicit across the platform.
 
 ## Observability and distributed tracing
 
