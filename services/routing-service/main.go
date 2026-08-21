@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -84,9 +86,11 @@ func (p *KafkaEventPublisher) Close() error {
 	return p.writer.Close()
 }
 
+// ProcessedEventStore keeps idempotency state outside the processing logic,
+// so duplicate event detection can use either in-memory or persistent storage.
 type ProcessedEventStore interface {
-    IsProcessed(eventID string) (bool, error)
-    MarkProcessed(eventID string) error
+	IsProcessed(eventID string) (bool, error)
+	MarkProcessed(eventID string) error
 }
 
 type InMemoryProcessedEventStore struct {
@@ -107,6 +111,51 @@ func (s *InMemoryProcessedEventStore) IsProcessed(eventID string) (bool, error) 
 func (s *InMemoryProcessedEventStore) MarkProcessed(eventID string) error {
 	s.processed[eventID] = struct{}{}
 	return nil
+}
+
+// PostgresProcessedEventStore persists processed event IDs so idempotency
+// survives Routing Service restarts.
+type PostgresProcessedEventStore struct {
+	db *sql.DB
+}
+
+func NewPostgresProcessedEventStore(db *sql.DB) *PostgresProcessedEventStore {
+	return &PostgresProcessedEventStore{
+		db: db,
+	}
+}
+
+func (s *PostgresProcessedEventStore) IsProcessed(eventID string) (bool, error) {
+	var exists bool
+
+	err := s.db.QueryRow(
+		`
+        SELECT EXISTS (
+            SELECT 1
+            FROM routing.processed_events
+            WHERE event_id = $1
+        )
+        `,
+		eventID,
+	).Scan(&exists)
+
+	if err != nil {
+		return false, err
+	}
+
+	return exists, nil
+}
+
+func (s *PostgresProcessedEventStore) MarkProcessed(eventID string) error {
+	_, err := s.db.Exec(
+		`
+        INSERT INTO routing.processed_events (event_id)
+        VALUES ($1)
+        `,
+		eventID,
+	)
+
+	return err
 }
 
 type Edge struct {
@@ -241,7 +290,8 @@ func shortestPath(graph Graph, origin, destination string) ([]string, float64, e
 }
 
 // processShipment contains the infrastructure-independent event processing flow:
-// calculate the route, build RouteCalculated, and publish it through the injected publisher.
+// skip already processed events, calculate the route, publish RouteCalculated,
+// and record successful processing through the injected store.
 func processShipment(
 	graph Graph,
 	event ShipmentCreatedEvent,
@@ -301,6 +351,19 @@ func main() {
 		return
 	}
 
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		fmt.Println("DATABASE_URL is not set")
+		return
+	}
+
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		fmt.Println("Error opening database:", err)
+		return
+	}
+	defer db.Close()
+
 	graph := buildGraph()
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
@@ -318,7 +381,7 @@ func main() {
 
 	defer publisher.Close()
 
-	processedEventStore := NewInMemoryProcessedEventStore()
+	processedEventStore := NewPostgresProcessedEventStore(db)
 
 	for {
 		message, err := reader.ReadMessage(context.Background())
