@@ -86,11 +86,21 @@ func (p *KafkaEventPublisher) Close() error {
 	return p.writer.Close()
 }
 
+// OutboxStore abstracts pending event retrieval and publication tracking,
+// keeping the outbox publishing flow independent from PostgreSQL.
+type OutboxStore interface {
+	GetPendingEvents() ([]RouteCalculatedEvent, error)
+	MarkPublished(eventID string) error
+}
+
 // ProcessedEventStore keeps idempotency state outside the processing logic,
 // so duplicate event detection can use either in-memory or persistent storage.
 type ProcessedEventStore interface {
 	IsProcessed(eventID string) (bool, error)
-	MarkProcessed(eventID string) error
+	MarkProcessedWithOutboxEvent(
+		eventID string,
+		outboxEvent RouteCalculatedEvent,
+	) error
 }
 
 type InMemoryProcessedEventStore struct {
@@ -108,7 +118,10 @@ func (s *InMemoryProcessedEventStore) IsProcessed(eventID string) (bool, error) 
 	return exists, nil
 }
 
-func (s *InMemoryProcessedEventStore) MarkProcessed(eventID string) error {
+func (s *InMemoryProcessedEventStore) MarkProcessedWithOutboxEvent(
+	eventID string,
+	outboxEvent RouteCalculatedEvent,
+) error {
 	s.processed[eventID] = struct{}{}
 	return nil
 }
@@ -146,12 +159,94 @@ func (s *PostgresProcessedEventStore) IsProcessed(eventID string) (bool, error) 
 	return exists, nil
 }
 
-func (s *PostgresProcessedEventStore) MarkProcessed(eventID string) error {
+func (s *PostgresProcessedEventStore) MarkProcessedWithOutboxEvent(
+	eventID string,
+	outboxEvent RouteCalculatedEvent,
+) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(
+		`
+		INSERT INTO routing.processed_events (event_id)
+		VALUES ($1)
+		`,
+		eventID,
+	); err != nil {
+		return err
+	}
+
+	payload, err := json.Marshal(outboxEvent)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(
+		`
+		INSERT INTO routing.outbox_events (
+			event_id,
+			event_type,
+			payload
+		)
+		VALUES ($1, $2, $3)
+		`,
+		outboxEvent.EventID,
+		outboxEvent.EventType,
+		payload,
+	); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (s *PostgresProcessedEventStore) GetPendingEvents() ([]RouteCalculatedEvent, error) {
+	rows, err := s.db.Query(`
+		SELECT payload
+		FROM routing.outbox_events
+		WHERE published_at IS NULL
+		ORDER BY created_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []RouteCalculatedEvent
+
+	for rows.Next() {
+		var payload []byte
+
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+
+		var event RouteCalculatedEvent
+
+		if err := json.Unmarshal(payload, &event); err != nil {
+			return nil, err
+		}
+
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return events, nil
+}
+
+func (s *PostgresProcessedEventStore) MarkPublished(eventID string) error {
 	_, err := s.db.Exec(
 		`
-        INSERT INTO routing.processed_events (event_id)
-        VALUES ($1)
-        `,
+		UPDATE routing.outbox_events
+		SET published_at = NOW()
+		WHERE event_id = $1
+		`,
 		eventID,
 	)
 
@@ -289,13 +384,35 @@ func shortestPath(graph Graph, origin, destination string) ([]string, float64, e
 	return path, distances[destination], nil
 }
 
+// publishPendingEvents publishes outbox events sequentially and marks each
+// event as published only after successful Kafka delivery.
+func publishPendingEvents(
+	outboxStore OutboxStore,
+	publisher EventPublisher,
+) error {
+	events, err := outboxStore.GetPendingEvents()
+	if err != nil {
+		return err
+	}
+
+	for _, event := range events {
+		if err := publisher.PublishRouteCalculated(event); err != nil {
+			return err
+		}
+		if err := outboxStore.MarkPublished(event.EventID); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // processShipment contains the infrastructure-independent event processing flow:
-// skip already processed events, calculate the route, publish RouteCalculated,
-// and record successful processing through the injected store.
+// skip already processed events, calculate the route, and atomically record
+// both the processed input event and the resulting RouteCalculated outbox event.
 func processShipment(
 	graph Graph,
 	event ShipmentCreatedEvent,
-	publisher EventPublisher,
 	processedEventStore ProcessedEventStore,
 ) error {
 	isProcessed, err := processedEventStore.IsProcessed(event.EventID)
@@ -327,11 +444,10 @@ func processShipment(
 		},
 	}
 
-	if err := publisher.PublishRouteCalculated(routeEvent); err != nil {
-		return err
-	}
-
-	if err := processedEventStore.MarkProcessed(event.EventID); err != nil {
+	if err := processedEventStore.MarkProcessedWithOutboxEvent(
+		event.EventID,
+		routeEvent,
+	); err != nil {
 		return err
 	}
 
@@ -383,6 +499,16 @@ func main() {
 
 	processedEventStore := NewPostgresProcessedEventStore(db)
 
+	go func() {
+		for {
+			if err := publishPendingEvents(processedEventStore, publisher); err != nil {
+				fmt.Println("Error publishing pending outbox events:", err)
+			}
+
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
 	for {
 		message, err := reader.ReadMessage(context.Background())
 		if err != nil {
@@ -405,7 +531,6 @@ func main() {
 		if err := processShipment(
 			graph,
 			event,
-			publisher,
 			processedEventStore,
 		); err != nil {
 			fmt.Printf(
@@ -417,7 +542,7 @@ func main() {
 		}
 
 		fmt.Printf(
-			"Route calculated and published for shipment %s\n",
+			"Route calculated and queued for shipment %s\n",
 			event.ShipmentID,
 		)
 	}

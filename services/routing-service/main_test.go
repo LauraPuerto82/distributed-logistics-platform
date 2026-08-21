@@ -23,6 +23,43 @@ func (p *FakeEventPublisher) PublishRouteCalculated(event RouteCalculatedEvent) 
 	return nil
 }
 
+type FakeProcessedEventStore struct {
+	processed    bool
+	outboxEvents []RouteCalculatedEvent
+	markErr      error
+}
+
+func (s *FakeProcessedEventStore) IsProcessed(eventID string) (bool, error) {
+	return s.processed, nil
+}
+
+func (s *FakeProcessedEventStore) MarkProcessedWithOutboxEvent(
+	eventID string,
+	outboxEvent RouteCalculatedEvent,
+) error {
+	if s.markErr != nil {
+		return s.markErr
+	}
+
+	s.processed = true
+	s.outboxEvents = append(s.outboxEvents, outboxEvent)
+	return nil
+}
+
+type FakeOutboxStore struct {
+	PendingEvents []RouteCalculatedEvent
+	PublishedIDs  []string
+}
+
+func (s *FakeOutboxStore) GetPendingEvents() ([]RouteCalculatedEvent, error) {
+	return s.PendingEvents, nil
+}
+
+func (s *FakeOutboxStore) MarkPublished(eventID string) error {
+	s.PublishedIDs = append(s.PublishedIDs, eventID)
+	return nil
+}
+
 func TestShortestPathMadridToBilbao(t *testing.T) {
 	graph := buildGraph()
 
@@ -105,10 +142,9 @@ func TestShortestPathNoRouteExists(t *testing.T) {
 	}
 }
 
-func TestProcessShipmentPublishesRouteCalculated(t *testing.T) {
+func TestProcessShipmentStoresRouteCalculatedOutboxEvent(t *testing.T) {
 	graph := buildGraph()
-	publisher := &FakeEventPublisher{}
-	processedEventStore := NewInMemoryProcessedEventStore()
+	processedEventStore := &FakeProcessedEventStore{}
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_input",
@@ -125,21 +161,20 @@ func TestProcessShipmentPublishesRouteCalculated(t *testing.T) {
 	err := processShipment(
 		graph,
 		event,
-		publisher,
 		processedEventStore,
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if len(publisher.PublishedEvents) != 1 {
+	if len(processedEventStore.outboxEvents) != 1 {
 		t.Fatalf(
-			"expected 1 published event, got %d",
-			len(publisher.PublishedEvents),
+			"expected 1 outbox event, got %d",
+			len(processedEventStore.outboxEvents),
 		)
 	}
 
-	routeEvent := publisher.PublishedEvents[0]
+	routeEvent := processedEventStore.outboxEvents[0]
 
 	if routeEvent.EventType != "RouteCalculated" {
 		t.Errorf(
@@ -183,14 +218,12 @@ func TestProcessShipmentPublishesRouteCalculated(t *testing.T) {
 	}
 }
 
-func TestProcessShipmentReturnsErrorWhenPublisherFails(t *testing.T) {
+func TestProcessShipmentReturnsErrorWhenStoreFails(t *testing.T) {
 	graph := buildGraph()
 
-	publisher := &FakeEventPublisher{
-		Err: errors.New("kafka unavailable"),
+	processedEventStore := &FakeProcessedEventStore{
+		markErr: errors.New("database unavailable"),
 	}
-
-	processedEventStore := NewInMemoryProcessedEventStore()
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_input",
@@ -207,7 +240,6 @@ func TestProcessShipmentReturnsErrorWhenPublisherFails(t *testing.T) {
 	err := processShipment(
 		graph,
 		event,
-		publisher,
 		processedEventStore,
 	)
 
@@ -216,10 +248,9 @@ func TestProcessShipmentReturnsErrorWhenPublisherFails(t *testing.T) {
 	}
 }
 
-func TestProcessShipmentDoesNotPublishDuplicateEvent(t *testing.T) {
+func TestProcessShipmentDoesNotStoreDuplicateEvent(t *testing.T) {
 	graph := buildGraph()
-	publisher := &FakeEventPublisher{}
-	processedEventStore := NewInMemoryProcessedEventStore()
+	processedEventStore := &FakeProcessedEventStore{}
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt-123",
@@ -234,18 +265,69 @@ func TestProcessShipmentDoesNotPublishDuplicateEvent(t *testing.T) {
 		},
 	}
 
-	if err := processShipment(graph, event, publisher, processedEventStore); err != nil {
+	if err := processShipment(graph, event, processedEventStore); err != nil {
 		t.Fatalf("first processing failed: %v", err)
 	}
 
-	if err := processShipment(graph, event, publisher, processedEventStore); err != nil {
+	if err := processShipment(graph, event, processedEventStore); err != nil {
 		t.Fatalf("second processing failed: %v", err)
+	}
+
+	if len(processedEventStore.outboxEvents) != 1 {
+		t.Fatalf(
+			"expected 1 outbox event, got %d",
+			len(processedEventStore.outboxEvents),
+		)
+	}
+}
+
+func TestPublishPendingEventsPublishesOutboxEvents(t *testing.T) {
+	outboxStore := &FakeOutboxStore{
+		PendingEvents: []RouteCalculatedEvent{
+			{
+				EventID:    "evt-outbox-1",
+				EventType:  "RouteCalculated",
+				ShipmentID: "shp-123",
+				Payload: RouteCalculatedPayload{
+					Path:       []string{"Madrid", "Zaragoza", "Bilbao"},
+					DistanceKM: 640,
+				},
+			},
+		},
+	}
+
+	publisher := &FakeEventPublisher{}
+
+	err := publishPendingEvents(outboxStore, publisher)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 
 	if len(publisher.PublishedEvents) != 1 {
 		t.Fatalf(
 			"expected 1 published event, got %d",
 			len(publisher.PublishedEvents),
+		)
+	}
+
+	if publisher.PublishedEvents[0].EventID != "evt-outbox-1" {
+		t.Errorf(
+			"expected event ID evt-outbox-1, got %s",
+			publisher.PublishedEvents[0].EventID,
+		)
+	}
+
+	if len(outboxStore.PublishedIDs) != 1 {
+		t.Fatalf(
+			"expected 1 published marker, got %d",
+			len(outboxStore.PublishedIDs),
+		)
+	}
+
+	if outboxStore.PublishedIDs[0] != "evt-outbox-1" {
+		t.Errorf(
+			"expected event ID evt-outbox-1 to be marked published, got %s",
+			outboxStore.PublishedIDs[0],
 		)
 	}
 }
