@@ -1052,8 +1052,130 @@ state is required where duplicate side effects would be unsafe.
 The system prefers possible duplicate delivery to silent event loss.
 
 Routing Service already applies persistent idempotency to `ShipmentCreated`.
-The same principle must be extended to Prediction Service when its reliability
-work is implemented.
+Prediction Service now applies the same principle to `RouteCalculated` events,
+using persistent `event_id`-based idempotency to tolerate repeated delivery.
+
+------------------------------------------------------------------------
+
+## ADR-021 --- Persist Prediction Service consumer idempotency in PostgreSQL
+
+**Status:** Accepted\
+**Stage:** Prediction Service reliability
+
+### Context
+
+Routing Service publishes `RouteCalculated` through an at-least-once
+transactional outbox. Around failures, the same persisted event may therefore
+be delivered to Prediction Service more than once with the same `event_id`.
+
+If Prediction recalculated the ETA for every delivery, each duplicate input
+could create a new `ETAPredicted` event with a different identity and repeat
+downstream side effects.
+
+An in-memory processed-event set would not survive service restarts.
+
+### Decision
+
+Persist processed `RouteCalculated.event_id` values in PostgreSQL.
+
+Prediction Service checks whether an input event has already been processed
+before running ETA prediction. Successfully processed input IDs are stored in
+`prediction.processed_events`.
+
+The persistence capability is exposed through `ProcessedEventStore`, allowing
+unit tests to use fakes while production uses `PostgresPredictionStore`.
+
+### Trade-off
+
+Each handled event requires PostgreSQL access and persistent idempotency state
+must be retained and managed.
+
+That cost is accepted because duplicate delivery is an expected possibility
+under the platform's at-least-once publication semantics.
+
+### Alternatives considered
+
+-   Track processed IDs only in memory.
+-   Assume Kafka consumer-group offsets prevent duplicate delivery.
+-   Recalculate the ETA for duplicate inputs and rely on downstream consumers.
+
+### Consequences
+
+Prediction Service can receive the same `RouteCalculated.event_id` more than
+once without recalculating the ETA or creating another downstream event.
+
+This makes Prediction a safe consumer of Routing's at-least-once outbox
+publication, but does not by itself guarantee reliable publication of
+`ETAPredicted`.
+
+------------------------------------------------------------------------
+
+## ADR-022 --- Use a Transactional Outbox for Prediction Service downstream events
+
+**Status:** Accepted\
+**Stage:** Prediction Service reliability
+
+### Context
+
+After calculating an ETA, Prediction Service needs to record the consumed
+`RouteCalculated` event as processed and publish `ETAPredicted` to Kafka.
+
+Persisting the processed input and publishing directly to Kafka would cross the
+PostgreSQL/Kafka boundary and recreate the same partial-failure problem already
+observed in Routing Service.
+
+### Decision
+
+Use a Transactional Outbox in Prediction Service.
+
+Within one PostgreSQL transaction, Prediction Service:
+
+``` text
+INSERT processed RouteCalculated event
+INSERT ETAPredicted outbox event
+COMMIT
+```
+
+The resulting `ETAPredicted` is not published directly from
+`handle_route_calculated`.
+
+A separate outbox publisher reads pending rows from
+`prediction.outbox_events`, publishes them to Kafka, and marks each row as
+published only after successful delivery.
+
+For the current MVP, the publisher runs independently from the Kafka consumer,
+polls every five seconds, and processes pending events sequentially.
+
+### Trade-off
+
+The design adds PostgreSQL persistence, an outbox table, a background publisher,
+and eventual rather than immediate Kafka publication.
+
+Polling also introduces up to approximately one polling interval of latency and
+does not optimize for high throughput.
+
+### Alternatives considered
+
+-   Publish `ETAPredicted` directly and then mark the input as processed.
+-   Mark the input as processed before publishing `ETAPredicted`.
+-   Attempt compensation after a partial failure.
+-   Use distributed transactions across PostgreSQL and Kafka.
+
+### Consequences
+
+Successfully processed `RouteCalculated` events cannot lose their corresponding
+`ETAPredicted` solely because Kafka is temporarily unavailable. The outgoing
+event remains durably pending and can be retried later.
+
+Publication remains at-least-once. If Kafka publication succeeds but persisting
+`published_at` fails, the same persisted `ETAPredicted.event_id` may be
+published again on a later retry.
+
+Downstream consumers must therefore tolerate duplicate delivery by `event_id`.
+
+PostgreSQL integration tests verify atomic processed-event/outbox persistence,
+rollback on partial failure, pending-event retrieval, and publication-state
+updates.
 
 ------------------------------------------------------------------------
 
@@ -1095,28 +1217,28 @@ introduced.
 
 ------------------------------------------------------------------------
 
-## TD-003 --- Prediction Service consumer is not yet idempotent
+## TD-003 --- Prediction Service consumer idempotency
 
+**Status:** Resolved\
 **Area:** Event processing\
 **Priority:** High
 
-**Current limitation:**\
-Routing Service now persists processed `ShipmentCreated.event_id` values in
-PostgreSQL and ignores duplicate deliveries across restarts.
+**Original limitation:**\
+Prediction Service did not persist which `RouteCalculated` events it had
+processed. If the same input event was delivered more than once, Prediction
+could process it again and create another `ETAPredicted` event.
 
-Prediction Service does not yet persist which `RouteCalculated` events it has
-processed. If the same input event is delivered more than once, Prediction may
-process it again and publish a duplicate `ETAPredicted` event.
-
-This is especially relevant because Routing's transactional outbox deliberately
+This was especially relevant because Routing's transactional outbox deliberately
 uses at-least-once publication semantics and may republish the same
 `RouteCalculated.event_id` around failures.
 
-**Planned evolution:**\
-Extend persistent `event_id`-based idempotency to Prediction Service and make
-its downstream side effects safe under duplicate delivery.
+**Resolution:**\
+Prediction Service now persists processed `RouteCalculated.event_id` values in
+PostgreSQL and ignores duplicate deliveries across restarts. Processing the input
+event and persisting the resulting `ETAPredicted` outbox event are performed
+atomically in the same PostgreSQL transaction.
 
-**Related decisions:** ADR-017, ADR-020
+**Related decisions:** ADR-017, ADR-020, ADR-021, ADR-022
 
 ------------------------------------------------------------------------
 
@@ -1173,9 +1295,9 @@ Introduce versioned database migrations when the schema starts evolving.
 **Priority:** Medium
 
 **Current limitation:**\
-Routing Service now has PostgreSQL integration tests for outbox persistence and
-retrieval behavior, while unit tests continue to isolate infrastructure through
-interfaces and fakes.
+Routing Service and Prediction Service now have PostgreSQL integration tests for
+outbox persistence and retrieval behavior, while unit tests continue to isolate
+infrastructure through interfaces and fakes.
 
 Integration coverage is still incomplete across the platform. In particular,
 real Kafka boundaries and other PostgreSQL-backed behavior are not yet covered
