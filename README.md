@@ -227,8 +227,8 @@ Tests are designed to run without PostgreSQL or Kafka where possible. Infrastruc
 | --- | --- |
 | `PostgresShipmentStore` | `InMemoryShipmentStore` |
 | `KafkaEventPublisher` | `FakeEventPublisher` |
-| `PostgresProcessedEventStore` | `FakeProcessedEventStore` |
-| `PostgresProcessedEventStore` (`OutboxStore`) | `FakeOutboxStore` |
+| `PostgresRoutingStore` (`ProcessedEventStore`) | `FakeProcessedEventStore` |
+| `PostgresRoutingStore` (`OutboxStore`) | `FakeOutboxStore` |
 
 Routing Service separates event-processing, outbox persistence, and event-publication behavior behind `ProcessedEventStore`, `OutboxStore`, and `EventPublisher`. Unit tests use fakes to verify idempotent processing, outbox event creation, publication, and at-least-once retry behavior without requiring PostgreSQL or Kafka.
 

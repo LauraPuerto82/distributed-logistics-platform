@@ -11,7 +11,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-func TestPostgresProcessedEventStoreGetPendingEvents(t *testing.T) {
+func TestPostgresRoutingStoreGetPendingEvents(t *testing.T) {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		t.Fatal("DATABASE_URL is not set")
@@ -23,7 +23,7 @@ func TestPostgresProcessedEventStoreGetPendingEvents(t *testing.T) {
 	}
 	defer db.Close()
 
-	store := NewPostgresProcessedEventStore(db)
+	store := NewPostgresRoutingStore(db)
 
 	event := RouteCalculatedEvent{
 		EventID:    "evt_integration_outbox",

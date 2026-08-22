@@ -126,19 +126,19 @@ func (s *InMemoryProcessedEventStore) MarkProcessedWithOutboxEvent(
 	return nil
 }
 
-// PostgresProcessedEventStore persists processed event IDs so idempotency
-// survives Routing Service restarts.
-type PostgresProcessedEventStore struct {
+// PostgresRoutingStore persists Routing Service reliability state,
+// including processed event IDs and transactional outbox events.
+type PostgresRoutingStore struct {
 	db *sql.DB
 }
 
-func NewPostgresProcessedEventStore(db *sql.DB) *PostgresProcessedEventStore {
-	return &PostgresProcessedEventStore{
+func NewPostgresRoutingStore(db *sql.DB) *PostgresRoutingStore {
+	return &PostgresRoutingStore{
 		db: db,
 	}
 }
 
-func (s *PostgresProcessedEventStore) IsProcessed(eventID string) (bool, error) {
+func (s *PostgresRoutingStore) IsProcessed(eventID string) (bool, error) {
 	var exists bool
 
 	err := s.db.QueryRow(
@@ -159,7 +159,7 @@ func (s *PostgresProcessedEventStore) IsProcessed(eventID string) (bool, error) 
 	return exists, nil
 }
 
-func (s *PostgresProcessedEventStore) MarkProcessedWithOutboxEvent(
+func (s *PostgresRoutingStore) MarkProcessedWithOutboxEvent(
 	eventID string,
 	outboxEvent RouteCalculatedEvent,
 ) error {
@@ -203,7 +203,7 @@ func (s *PostgresProcessedEventStore) MarkProcessedWithOutboxEvent(
 	return tx.Commit()
 }
 
-func (s *PostgresProcessedEventStore) GetPendingEvents() ([]RouteCalculatedEvent, error) {
+func (s *PostgresRoutingStore) GetPendingEvents() ([]RouteCalculatedEvent, error) {
 	rows, err := s.db.Query(`
 		SELECT payload
 		FROM routing.outbox_events
@@ -240,7 +240,7 @@ func (s *PostgresProcessedEventStore) GetPendingEvents() ([]RouteCalculatedEvent
 	return events, nil
 }
 
-func (s *PostgresProcessedEventStore) MarkPublished(eventID string) error {
+func (s *PostgresRoutingStore) MarkPublished(eventID string) error {
 	_, err := s.db.Exec(
 		`
 		UPDATE routing.outbox_events
@@ -497,11 +497,11 @@ func main() {
 
 	defer publisher.Close()
 
-	processedEventStore := NewPostgresProcessedEventStore(db)
+	store := NewPostgresRoutingStore(db)
 
 	go func() {
 		for {
-			if err := publishPendingEvents(processedEventStore, publisher); err != nil {
+			if err := publishPendingEvents(store, publisher); err != nil {
 				fmt.Println("Error publishing pending outbox events:", err)
 			}
 
@@ -531,7 +531,7 @@ func main() {
 		if err := processShipment(
 			graph,
 			event,
-			processedEventStore,
+			store,
 		); err != nil {
 			fmt.Printf(
 				"Failed to process shipment %s: %v\n",
