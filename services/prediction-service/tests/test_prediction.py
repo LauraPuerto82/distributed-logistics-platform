@@ -7,16 +7,21 @@ from prediction_service.prediction import (
 )
 
 
-class FakeEventPublisher:
-    def __init__(self, error=None):
-        self.published_events = []
-        self.error = error
+class FakeProcessedEventStore:
+    def __init__(self):
+        self.processed_event_ids = set()
+        self.outbox_events = []
 
-    def publish_eta_predicted(self, event):
-        if self.error:
-            raise self.error
+    def is_processed(self, event_id: str) -> bool:
+        return event_id in self.processed_event_ids
 
-        self.published_events.append(event)
+    def mark_processed_with_outbox_event(
+        self,
+        event_id: str,
+        outbox_event,
+    ) -> None:
+        self.processed_event_ids.add(event_id)
+        self.outbox_events.append(outbox_event)
 
 
 def test_predict_travel_time():
@@ -60,8 +65,8 @@ def test_process_route_calculated_creates_eta_predicted_event():
     assert result.event_id != route_event.event_id
 
 
-def test_handle_route_calculated_publishes_eta_predicted():
-    publisher = FakeEventPublisher()
+def test_handle_route_calculated_stores_eta_predicted_outbox_event():
+    store = FakeProcessedEventStore()
 
     route_event = RouteCalculatedEvent(
         event_id="evt_route_123",
@@ -74,22 +79,23 @@ def test_handle_route_calculated_publishes_eta_predicted():
         },
     )
 
-    result = handle_route_calculated(route_event, publisher)
+    result = handle_route_calculated(route_event, store)
 
-    assert len(publisher.published_events) == 1
+    assert result is not None
+    assert len(store.outbox_events) == 1
 
-    published_event = publisher.published_events[0]
+    stored_event = store.outbox_events[0]
 
-    assert published_event.event_type == "ETAPredicted"
-    assert published_event.shipment_id == "shp_123"
-    assert published_event.payload.estimated_travel_minutes == 552
+    assert stored_event.event_type == "ETAPredicted"
+    assert stored_event.shipment_id == "shp_123"
+    assert stored_event.payload.estimated_travel_minutes == 552
 
-    assert result == published_event
+    assert result == stored_event
+    assert route_event.event_id in store.processed_event_ids
 
-def test_handle_route_calculated_propagates_publisher_error():
-    publisher = FakeEventPublisher(
-        error=RuntimeError("Kafka unavailable")
-    )
+
+def test_handle_route_calculated_does_not_process_duplicate_event():
+    store = FakeProcessedEventStore()
 
     route_event = RouteCalculatedEvent(
         event_id="evt_route_123",
@@ -102,5 +108,9 @@ def test_handle_route_calculated_propagates_publisher_error():
         },
     )
 
-    with pytest.raises(RuntimeError, match="Kafka unavailable"):
-        handle_route_calculated(route_event, publisher)
+    first_result = handle_route_calculated(route_event, store)
+    second_result = handle_route_calculated(route_event, store)
+
+    assert first_result is not None
+    assert second_result is None
+    assert len(store.outbox_events) == 1
