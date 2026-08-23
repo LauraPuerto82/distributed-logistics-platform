@@ -66,6 +66,7 @@ POST /shipments
 → check whether the event was already processed
 → calculate shortest route
 → atomically persist processed event + RouteCalculated outbox event
+→ commit the consumed Kafka offset after successful processing
 → Routing Outbox Publisher reads pending events
 → publish RouteCalculated to Kafka
 → mark outbox event as published
@@ -272,6 +273,7 @@ PostgreSQL-specific behavior is covered separately by integration tests, includi
 | Shortest-path routing (Dijkstra) | Implemented |
 | `ShipmentCreated` consumption | Implemented |
 | Routing consumer idempotency | Implemented |
+| Routing explicit Kafka offset commits | Implemented |
 | Routing transactional outbox | Implemented |
 | `RouteCalculated` publication | Implemented |
 | Routing PostgreSQL integration tests | Implemented |
@@ -306,10 +308,12 @@ Order Service
 
 The Order → Routing → Prediction flow is implemented. Both Routing and Prediction now provide persistent consumer idempotency and transactional outbox publication with at-least-once delivery semantics.
 
-The next reliability milestone is to define explicit Kafka offset-commit and retry semantics across consumers, including how offset commits relate to successful PostgreSQL processing and how failures should be retried or eventually routed to a dead-letter strategy.
+Routing Service now uses explicit Kafka offset commits: a consumed `ShipmentCreated` is committed only after successful processing and durable PostgreSQL persistence. If the offset commit fails after processing succeeds, persistent `event_id`-based idempotency makes redelivery safe.
+
+The next reliability milestone is to extend explicit Kafka offset-commit semantics to Prediction Service and define retry, backoff, and dead-letter behavior for permanently failing messages.
 
 ## Architecture Decisions
 
 Architecture decisions, trade-offs, known technical debt, and intentionally deferred improvements are documented separately in [`docs/ARCHITECTURE_DECISIONS.md`](docs/ARCHITECTURE_DECISIONS.md).
 
-This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, and the remaining work around explicit Kafka offset-commit and retry behavior.
+This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in Routing, and the remaining work around Prediction offset commits, retries, and dead-letter handling.
