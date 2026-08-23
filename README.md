@@ -312,10 +312,12 @@ The Order → Routing → Prediction flow is implemented. Both Routing and Predi
 
 Both Routing and Prediction now use explicit Kafka offset commits. A consumed event is committed only after successful processing and durable PostgreSQL persistence. If the offset commit fails after processing succeeds, persistent `event_id`-based idempotency makes redelivery safe.
 
-The next reliability milestone is to define retry, backoff, and dead-letter behavior for permanently failing messages.
+Routing Service now sends malformed JSON directly to `routing-service-dlq` and commits the original Kafka offset only after the dead-letter publication succeeds. If dead-letter publication fails, the original offset remains uncommitted; if the later offset commit fails, redelivery may produce a duplicate dead-letter record, which is intentionally accepted as at-least-once DLQ delivery.
+
+The next reliability milestone is to add retry and backoff behavior for transient Routing failures, then extend the same permanent/transient failure policy to Prediction Service.
 
 ## Architecture Decisions
 
 Architecture decisions, trade-offs, known technical debt, and intentionally deferred improvements are documented separately in [`docs/ARCHITECTURE_DECISIONS.md`](docs/ARCHITECTURE_DECISIONS.md).
 
-This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in both consumers, and the remaining work around retries and dead-letter handling.
+This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in both consumers, Routing dead-letter handling for malformed JSON, and the remaining work around transient retries/backoff and Prediction dead-letter handling.
