@@ -18,6 +18,7 @@ KAFKA_GROUP_ID = "prediction-service"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+
 def create_consumer() -> Consumer:
     return Consumer(
         {
@@ -25,8 +26,10 @@ def create_consumer() -> Consumer:
             "group.id": KAFKA_GROUP_ID,
             # New consumer groups replay available events; existing groups resume from committed offsets.
             "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
         }
     )
+
 
 def run_outbox_publisher(
     store: PostgresPredictionStore,
@@ -39,6 +42,47 @@ def run_outbox_publisher(
             print(f"Failed to publish pending outbox events: {exc}")
 
         time.sleep(5)
+
+
+def handle_kafka_message(
+    message,
+    store: PostgresPredictionStore,
+    consumer: Consumer,
+) -> None:
+    try:
+        data = json.loads(message.value().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"Invalid Kafka message, skipping: {exc}")
+        return
+
+    # Multiple event types share the topic; this service only handles RouteCalculated.
+    if data.get("event_type") != "RouteCalculated":
+        consumer.commit(message=message, asynchronous=False)
+        return
+
+    try:
+        event = RouteCalculatedEvent.model_validate(data)
+    except ValidationError as exc:
+        print(f"Invalid RouteCalculated event, skipping: {exc}")
+        return
+
+    eta_event = handle_route_calculated(
+        event,
+        store,
+    )
+
+    # Commit the Kafka offset only after processing has completed successfully.
+    # If the commit fails, persistent event-id idempotency makes redelivery safe.
+    consumer.commit(message=message, asynchronous=False)
+
+    if eta_event is None:
+        return
+
+    print(
+        f"ETA predicted and queued for shipment {eta_event.shipment_id}: "
+        f"{eta_event.payload.estimated_travel_minutes} minutes"
+    )
+
 
 def main():
     consumer = create_consumer()
@@ -69,33 +113,10 @@ def main():
                 print(f"Kafka consumer error: {message.error()}")
                 continue
 
-            try:
-                data = json.loads(message.value().decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                print(f"Invalid Kafka message, skipping: {exc}")
-                continue
-
-            # Multiple event types share the topic; this service only handles RouteCalculated.
-            if data.get("event_type") != "RouteCalculated":
-                continue
-
-            try:
-                event = RouteCalculatedEvent.model_validate(data)
-            except ValidationError as exc:
-                print(f"Invalid RouteCalculated event, skipping: {exc}")
-                continue
-
-            eta_event = handle_route_calculated(
-                event,
+            handle_kafka_message(
+                message,
                 store,
-            )
-
-            if eta_event is None:
-                continue
-
-            print(
-                f"ETA predicted and queued for shipment {eta_event.shipment_id}: "
-                f"{eta_event.payload.estimated_travel_minutes} minutes"
+                consumer,
             )
 
     finally:
