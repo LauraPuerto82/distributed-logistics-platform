@@ -1298,6 +1298,119 @@ Unit tests verify that:
 The happy path and failed-processing redelivery behavior were also verified
 manually with Kafka and PostgreSQL running.
 
+------------------------------------------------------------------------
+
+## ADR-024 --- Commit Prediction Kafka offsets only after successful processing
+
+**Status:** Accepted\
+**Stage:** Prediction Service consumer reliability
+
+### Context
+
+Prediction Service consumes `RouteCalculated` through the `prediction-service`
+consumer group.
+
+As with Routing Service, allowing Kafka offsets to advance independently from
+successful application processing creates an unsafe failure window:
+
+``` text
+Kafka delivers RouteCalculated
+offset committed
+PostgreSQL processing fails
+```
+
+In that case Kafka may consider the message consumed even though Prediction
+Service did not durably record the processed input event or create its
+corresponding `ETAPredicted` outbox event.
+
+Prediction Service already provides persistent `event_id`-based idempotency and
+a transactional outbox, so the safer ordering is to complete durable processing
+before committing the consumed Kafka offset.
+
+### Decision
+
+Disable Kafka automatic offset commits in Prediction Service and commit offsets
+explicitly.
+
+For a `RouteCalculated` event:
+
+``` text
+fetch message
+validate event
+process event
+commit processed event + ETAPredicted outbox event in PostgreSQL
+commit Kafka offset
+```
+
+The consumed Kafka offset is committed only after application processing has
+completed successfully and the PostgreSQL transaction has committed.
+
+If decoding, validation, or processing fails, the offset is not committed.
+
+If the offset commit fails after PostgreSQL processing succeeds, Kafka may
+redeliver the same message. Persistent `event_id`-based idempotency makes that
+redelivery safe and prevents a second `ETAPredicted` outbox event from being
+created.
+
+Events on the shared topic that Prediction Service deliberately does not handle
+are committed after they are identified as irrelevant to Prediction.
+
+Consumer-message handling is separated into `handle_kafka_message`, allowing
+offset-commit behavior to be tested independently from the long-running consumer
+loop.
+
+### Trade-off
+
+Manual offset management introduces additional control flow and failure cases.
+
+A successfully processed `RouteCalculated` event can still be redelivered if
+the Kafka offset commit fails afterwards.
+
+That duplicate delivery is intentionally accepted because Prediction Service
+already provides persistent consumer idempotency.
+
+Malformed or invalid `RouteCalculated` events are deliberately not committed
+with the current behavior. Without retry limits or a dead-letter strategy, such
+messages can therefore be redelivered indefinitely.
+
+### Alternatives considered
+
+-   Continue using automatic offset commits.
+-   Commit the offset before application processing.
+-   Commit invalid events immediately and discard them permanently.
+-   Commit offsets periodically without tying them to successful processing.
+-   Treat duplicate delivery as an error instead of relying on persistent
+    idempotency.
+
+### Consequences
+
+Prediction Service now prefers possible redelivery over silently losing an
+unprocessed `RouteCalculated` event.
+
+The main failure windows become:
+
+``` text
+processing fails
+→ no offset commit
+→ Kafka may redeliver
+
+processing succeeds
+→ offset commit fails
+→ Kafka may redeliver
+→ persistent idempotency prevents duplicate business effects
+```
+
+Unit tests verify that:
+
+-   ignored event types are committed;
+-   successfully processed `RouteCalculated` events are committed;
+-   failed processing does not commit the offset;
+-   a commit failure after successful processing can be retried safely without
+    generating another outbox event.
+
+The happy path and failed-processing redelivery behavior were also verified
+manually with Kafka and PostgreSQL running.
+
 # Known Technical Debt
 
 ## TD-001 --- Non-atomic PostgreSQL + Kafka writes
@@ -1443,28 +1556,28 @@ consumers make it necessary.
 
 ------------------------------------------------------------------------
 
-## TD-009 --- Consumer offset commit semantics are only explicit in Routing Service
+## TD-009 --- Consumer retry and dead-letter semantics are not defined
 
 **Area:** Event processing reliability\
 **Priority:** High
 
 **Current limitation:**\
-Routing Service now explicitly commits Kafka offsets only after successful
-processing and durable PostgreSQL persistence.
+Routing Service and Prediction Service now explicitly commit Kafka offsets only
+after successful processing and durable PostgreSQL persistence.
 
-Prediction Service still relies on its Kafka client's consumer-group offset
-behavior and does not yet apply the same explicit processing/commit policy.
+Failed processing therefore leaves the offset uncommitted and allows Kafka to
+redeliver the message.
 
-Retry, backoff, and dead-letter behavior are also not yet defined across the
-platform. Permanently invalid or repeatedly failing messages therefore still
-require an explicit policy.
+The platform does not yet define retry limits, backoff, dead-letter handling, or
+a general poison-message policy. A permanently invalid or repeatedly failing
+message can therefore be redelivered indefinitely.
 
 **Planned evolution:**\
-Extend explicit consumer processing and offset-commit semantics to Prediction
-Service, then define retry, backoff, and dead-letter behavior for transient and
-permanent consumer failures.
+Define retry, backoff, and dead-letter behavior that distinguishes transient
+processing failures from permanently invalid messages while preserving the
+current at-least-once and idempotency guarantees.
 
-**Related decision:** ADR-023
+**Related decisions:** ADR-023, ADR-024
 
 ------------------------------------------------------------------------
 
