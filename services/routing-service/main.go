@@ -92,6 +92,73 @@ type MessageCommitter interface {
 	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
 }
 
+// DeadLetterPublisher abstracts publication of messages that cannot be
+// processed successfully and should leave the normal consumer flow.
+type DeadLetterPublisher interface {
+	PublishDeadLetter(
+		ctx context.Context,
+		message kafka.Message,
+		reason string,
+	) error
+}
+
+type DeadLetterEvent struct {
+	OriginalTopic     string `json:"original_topic"`
+	OriginalPartition int    `json:"original_partition"`
+	OriginalOffset    int64  `json:"original_offset"`
+	Reason            string `json:"reason"`
+	FailedAt          string `json:"failed_at"`
+	OriginalValue     string `json:"original_value"`
+}
+
+type KafkaDeadLetterPublisher struct {
+	writer *kafka.Writer
+}
+
+func NewKafkaDeadLetterPublisher(
+	brokerAddress string,
+	topic string,
+) *KafkaDeadLetterPublisher {
+	return &KafkaDeadLetterPublisher{
+		writer: &kafka.Writer{
+			Addr:  kafka.TCP(brokerAddress),
+			Topic: topic,
+		},
+	}
+}
+
+func (p *KafkaDeadLetterPublisher) PublishDeadLetter(
+	ctx context.Context,
+	message kafka.Message,
+	reason string,
+) error {
+	deadLetterEvent := DeadLetterEvent{
+		OriginalTopic:     message.Topic,
+		OriginalPartition: message.Partition,
+		OriginalOffset:    message.Offset,
+		Reason:            reason,
+		FailedAt:          time.Now().UTC().Format(time.RFC3339),
+		OriginalValue:     string(message.Value),
+	}
+
+	value, err := json.Marshal(deadLetterEvent)
+	if err != nil {
+		return fmt.Errorf("marshal dead-letter event: %w", err)
+	}
+
+	return p.writer.WriteMessages(
+		ctx,
+		kafka.Message{
+			Key:   message.Key,
+			Value: value,
+		},
+	)
+}
+
+func (p *KafkaDeadLetterPublisher) Close() error {
+	return p.writer.Close()
+}
+
 // OutboxStore abstracts pending event retrieval and publication tracking,
 // keeping the outbox publishing flow independent from PostgreSQL.
 type OutboxStore interface {
@@ -466,11 +533,20 @@ func handleKafkaMessage(
 	graph Graph,
 	store ProcessedEventStore,
 	committer MessageCommitter,
+	deadLetterPublisher DeadLetterPublisher,
 ) error {
 	var event ShipmentCreatedEvent
 
 	if err := json.Unmarshal(message.Value, &event); err != nil {
-		return fmt.Errorf("decode event: %w", err)
+		if err := deadLetterPublisher.PublishDeadLetter(
+			ctx,
+			message,
+			"invalid JSON",
+		); err != nil {
+			return fmt.Errorf("publish dead-letter message: %w", err)
+		}
+
+		return committer.CommitMessages(ctx, message)
 	}
 
 	// Multiple event types share the topic; Routing Service only handles ShipmentCreated.
@@ -535,6 +611,13 @@ func main() {
 
 	defer publisher.Close()
 
+	deadLetterPublisher := NewKafkaDeadLetterPublisher(
+		kafkaBroker,
+		"routing-service-dlq",
+	)
+
+	defer deadLetterPublisher.Close()
+
 	store := NewPostgresRoutingStore(db)
 
 	go func() {
@@ -560,6 +643,7 @@ func main() {
 			graph,
 			store,
 			reader,
+			deadLetterPublisher,
 		); err != nil {
 			fmt.Println("Error handling Kafka message:", err)
 			continue

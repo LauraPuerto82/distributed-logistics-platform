@@ -86,6 +86,26 @@ func (c *FakeMessageCommitter) CommitMessages(
 	return nil
 }
 
+type FakeDeadLetterPublisher struct {
+	PublishedMessages []kafka.Message
+	Reasons           []string
+	Err               error
+}
+
+func (p *FakeDeadLetterPublisher) PublishDeadLetter(
+	ctx context.Context,
+	message kafka.Message,
+	reason string,
+) error {
+	if p.Err != nil {
+		return p.Err
+	}
+
+	p.PublishedMessages = append(p.PublishedMessages, message)
+	p.Reasons = append(p.Reasons, reason)
+	return nil
+}
+
 func TestShortestPathMadridToBilbao(t *testing.T) {
 	graph := buildGraph()
 
@@ -409,6 +429,7 @@ func TestHandleKafkaMessageCommitsIgnoredEvent(t *testing.T) {
 	graph := buildGraph()
 	store := NewInMemoryProcessedEventStore()
 	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
 
 	event := RouteCalculatedEvent{
 		EventID:    "evt_route_123",
@@ -439,6 +460,7 @@ func TestHandleKafkaMessageCommitsIgnoredEvent(t *testing.T) {
 		graph,
 		store,
 		committer,
+		deadLetterPublisher,
 	)
 	if err != nil {
 		t.Fatalf("expected ignored event to be handled successfully, got %v", err)
@@ -464,6 +486,7 @@ func TestHandleKafkaMessageCommitsSuccessfullyProcessedShipment(t *testing.T) {
 	graph := buildGraph()
 	store := NewInMemoryProcessedEventStore()
 	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_shipment_123",
@@ -496,6 +519,7 @@ func TestHandleKafkaMessageCommitsSuccessfullyProcessedShipment(t *testing.T) {
 		graph,
 		store,
 		committer,
+		deadLetterPublisher,
 	)
 	if err != nil {
 		t.Fatalf("expected message to be handled successfully, got %v", err)
@@ -549,6 +573,7 @@ func TestHandleKafkaMessageDoesNotCommitWhenProcessingFails(t *testing.T) {
 	}
 
 	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_shipment_456",
@@ -581,6 +606,7 @@ func TestHandleKafkaMessageDoesNotCommitWhenProcessingFails(t *testing.T) {
 		graph,
 		store,
 		committer,
+		deadLetterPublisher,
 	)
 
 	if err == nil {
@@ -602,6 +628,7 @@ func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
 	committer := &FakeMessageCommitter{
 		CommitErr: errors.New("commit unavailable"),
 	}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_shipment_789",
@@ -635,6 +662,7 @@ func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
 		graph,
 		store,
 		committer,
+		deadLetterPublisher,
 	)
 
 	if err == nil {
@@ -659,6 +687,7 @@ func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
 		graph,
 		store,
 		committer,
+		deadLetterPublisher,
 	)
 	if err != nil {
 		t.Fatalf("expected redelivery to succeed, got %v", err)
@@ -674,6 +703,190 @@ func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
 		t.Fatalf(
 			"expected 1 outbox event after redelivery, got %d",
 			len(store.outboxEvents),
+		)
+	}
+}
+
+func TestHandleKafkaMessageSendsMalformedJSONToDeadLetterAndCommits(t *testing.T) {
+	graph := buildGraph()
+	store := NewInMemoryProcessedEventStore()
+	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    29,
+		Value:     []byte(`{"event_id": "evt_invalid_001", invalid json}`),
+	}
+
+	err := handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+	)
+
+	if err != nil {
+		t.Fatalf("expected malformed message to be handled successfully, got %v", err)
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter message, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if len(deadLetterPublisher.Reasons) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter reason, got %d",
+			len(deadLetterPublisher.Reasons),
+		)
+	}
+
+	if deadLetterPublisher.Reasons[0] != "invalid JSON" {
+		t.Fatalf(
+			"expected dead-letter reason %q, got %q",
+			"invalid JSON",
+			deadLetterPublisher.Reasons[0],
+		)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	if committer.CommittedMessages[0].Offset != message.Offset {
+		t.Fatalf(
+			"expected committed offset %d, got %d",
+			message.Offset,
+			committer.CommittedMessages[0].Offset,
+		)
+	}
+}
+
+func TestHandleKafkaMessageDoesNotCommitWhenDeadLetterPublicationFails(t *testing.T) {
+	graph := buildGraph()
+	store := NewInMemoryProcessedEventStore()
+	committer := &FakeMessageCommitter{}
+
+	deadLetterPublisher := &FakeDeadLetterPublisher{
+		Err: errors.New("dlq unavailable"),
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    30,
+		Value:     []byte(`{"event_id": "evt_invalid_002", invalid json}`),
+	}
+
+	err := handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+	)
+
+	if err == nil {
+		t.Fatal("expected dead-letter publication to fail")
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 0 {
+		t.Fatalf(
+			"expected no successful dead-letter publications, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if len(committer.CommittedMessages) != 0 {
+		t.Fatalf(
+			"expected original message not to be committed, got %d commits",
+			len(committer.CommittedMessages),
+		)
+	}
+}
+
+func TestHandleKafkaMessageCanRepublishDeadLetterAfterCommitFailure(t *testing.T) {
+	graph := buildGraph()
+	store := NewInMemoryProcessedEventStore()
+
+	committer := &FakeMessageCommitter{
+		CommitErr: errors.New("commit unavailable"),
+	}
+
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    31,
+		Value:     []byte(`{"event_id": "evt_invalid_003", invalid json}`),
+	}
+
+	// First delivery: DLQ publication succeeds, but offset commit fails.
+	err := handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+	)
+
+	if err == nil {
+		t.Fatal("expected commit failure")
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter publication, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if len(committer.CommittedMessages) != 0 {
+		t.Fatalf(
+			"expected no successful commits, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	// Simulate Kafka redelivering the same original message.
+	committer.CommitErr = nil
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+	)
+
+	if err != nil {
+		t.Fatalf("expected redelivery to succeed, got %v", err)
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 2 {
+		t.Fatalf(
+			"expected duplicate dead-letter publication after redelivery, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 successful commit, got %d",
+			len(committer.CommittedMessages),
 		)
 	}
 }
