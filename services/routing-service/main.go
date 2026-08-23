@@ -86,6 +86,12 @@ func (p *KafkaEventPublisher) Close() error {
 	return p.writer.Close()
 }
 
+// MessageCommitter abstracts Kafka offset commits so message-processing
+// semantics can be tested without a running Kafka broker.
+type MessageCommitter interface {
+	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
+}
+
 // OutboxStore abstracts pending event retrieval and publication tracking,
 // keeping the outbox publishing flow independent from PostgreSQL.
 type OutboxStore interface {
@@ -454,6 +460,38 @@ func processShipment(
 	return nil
 }
 
+func handleKafkaMessage(
+	ctx context.Context,
+	message kafka.Message,
+	graph Graph,
+	store ProcessedEventStore,
+	committer MessageCommitter,
+) error {
+	var event ShipmentCreatedEvent
+
+	if err := json.Unmarshal(message.Value, &event); err != nil {
+		return fmt.Errorf("decode event: %w", err)
+	}
+
+	// Multiple event types share the topic; Routing Service only handles ShipmentCreated.
+	if event.EventType != "ShipmentCreated" {
+		return committer.CommitMessages(ctx, message)
+	}
+
+	// Commit the Kafka offset only after the event has been processed successfully.
+	// If processing fails, leaving the offset uncommitted allows Kafka to redeliver
+	// the message; persistent event-id idempotency makes that redelivery safe.
+	if err := processShipment(
+		graph,
+		event,
+		store,
+	); err != nil {
+		return err
+	}
+
+	return committer.CommitMessages(ctx, message)
+}
+
 func main() {
 	kafkaBroker := os.Getenv("KAFKA_BROKER")
 	if kafkaBroker == "" {
@@ -510,40 +548,23 @@ func main() {
 	}()
 
 	for {
-		message, err := reader.ReadMessage(context.Background())
+		message, err := reader.FetchMessage(context.Background())
 		if err != nil {
 			fmt.Println("Error reading message:", err)
 			continue
 		}
 
-		var event ShipmentCreatedEvent
-
-		if err := json.Unmarshal(message.Value, &event); err != nil {
-			fmt.Println("Error decoding event:", err)
-			continue
-		}
-
-		// Multiple event types share the topic; Routing Service only handles ShipmentCreated.
-		if event.EventType != "ShipmentCreated" {
-			continue
-		}
-
-		if err := processShipment(
+		if err := handleKafkaMessage(
+			context.Background(),
+			message,
 			graph,
-			event,
 			store,
+			reader,
 		); err != nil {
-			fmt.Printf(
-				"Failed to process shipment %s: %v\n",
-				event.ShipmentID,
-				err,
-			)
+			fmt.Println("Error handling Kafka message:", err)
 			continue
 		}
 
-		fmt.Printf(
-			"Route calculated and queued for shipment %s\n",
-			event.ShipmentID,
-		)
+		fmt.Println("Kafka message handled successfully")
 	}
 }

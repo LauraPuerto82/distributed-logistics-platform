@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/segmentio/kafka-go"
 )
 
 // FakeEventPublisher captures published events and can simulate
@@ -62,6 +66,23 @@ func (s *FakeOutboxStore) MarkPublished(eventID string) error {
 	}
 
 	s.PublishedIDs = append(s.PublishedIDs, eventID)
+	return nil
+}
+
+type FakeMessageCommitter struct {
+	CommittedMessages []kafka.Message
+	CommitErr         error
+}
+
+func (c *FakeMessageCommitter) CommitMessages(
+	ctx context.Context,
+	msgs ...kafka.Message,
+) error {
+	if c.CommitErr != nil {
+		return c.CommitErr
+	}
+
+	c.CommittedMessages = append(c.CommittedMessages, msgs...)
 	return nil
 }
 
@@ -381,5 +402,278 @@ func TestPublishPendingEventsCanRepublishWhenMarkPublishedFails(t *testing.T) {
 
 	if publisher.PublishedEvents[0].EventID != publisher.PublishedEvents[1].EventID {
 		t.Fatal("expected the retry to publish the same event ID")
+	}
+}
+
+func TestHandleKafkaMessageCommitsIgnoredEvent(t *testing.T) {
+	graph := buildGraph()
+	store := NewInMemoryProcessedEventStore()
+	committer := &FakeMessageCommitter{}
+
+	event := RouteCalculatedEvent{
+		EventID:    "evt_route_123",
+		EventType:  "RouteCalculated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_123",
+		Payload: RouteCalculatedPayload{
+			Path:       []string{"Madrid", "Zaragoza"},
+			DistanceKM: 320,
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    25,
+		Value:     value,
+	}
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+	)
+	if err != nil {
+		t.Fatalf("expected ignored event to be handled successfully, got %v", err)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	if committer.CommittedMessages[0].Offset != message.Offset {
+		t.Fatalf(
+			"expected committed offset %d, got %d",
+			message.Offset,
+			committer.CommittedMessages[0].Offset,
+		)
+	}
+}
+
+func TestHandleKafkaMessageCommitsSuccessfullyProcessedShipment(t *testing.T) {
+	graph := buildGraph()
+	store := NewInMemoryProcessedEventStore()
+	committer := &FakeMessageCommitter{}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_shipment_123",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_123",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    26,
+		Value:     value,
+	}
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+	)
+	if err != nil {
+		t.Fatalf("expected message to be handled successfully, got %v", err)
+	}
+
+	isProcessed, err := store.IsProcessed(event.EventID)
+	if err != nil {
+		t.Fatalf("failed to check processed event: %v", err)
+	}
+
+	if !isProcessed {
+		t.Fatal("expected shipment event to be marked as processed")
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	if committer.CommittedMessages[0].Offset != message.Offset {
+		t.Fatalf(
+			"expected committed offset %d, got %d",
+			message.Offset,
+			committer.CommittedMessages[0].Offset,
+		)
+	}
+}
+
+type FailingProcessedEventStore struct {
+	ProcessErr error
+}
+
+func (s *FailingProcessedEventStore) IsProcessed(eventID string) (bool, error) {
+	return false, nil
+}
+
+func (s *FailingProcessedEventStore) MarkProcessedWithOutboxEvent(
+	eventID string,
+	outboxEvent RouteCalculatedEvent,
+) error {
+	return s.ProcessErr
+}
+
+func TestHandleKafkaMessageDoesNotCommitWhenProcessingFails(t *testing.T) {
+	graph := buildGraph()
+
+	store := &FailingProcessedEventStore{
+		ProcessErr: errors.New("database unavailable"),
+	}
+
+	committer := &FakeMessageCommitter{}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_shipment_456",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_456",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    27,
+		Value:     value,
+	}
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+	)
+
+	if err == nil {
+		t.Fatal("expected message handling to fail")
+	}
+
+	if len(committer.CommittedMessages) != 0 {
+		t.Fatalf(
+			"expected no committed messages, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+}
+
+func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
+	graph := buildGraph()
+	store := &FakeProcessedEventStore{}
+
+	committer := &FakeMessageCommitter{
+		CommitErr: errors.New("commit unavailable"),
+	}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_shipment_789",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_789",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    28,
+		Value:     value,
+	}
+
+	// Processing succeeds, but committing the Kafka offset fails.
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+	)
+
+	if err == nil {
+		t.Fatal("expected commit failure")
+	}
+
+	isProcessed, err := store.IsProcessed(event.EventID)
+	if err != nil {
+		t.Fatalf("failed to check processed event: %v", err)
+	}
+
+	if !isProcessed {
+		t.Fatal("expected event to remain processed after commit failure")
+	}
+
+	// Simulate Kafka redelivering the same message later.
+	committer.CommitErr = nil
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+	)
+	if err != nil {
+		t.Fatalf("expected redelivery to succeed, got %v", err)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 successful committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+	if len(store.outboxEvents) != 1 {
+		t.Fatalf(
+			"expected 1 outbox event after redelivery, got %d",
+			len(store.outboxEvents),
+		)
 	}
 }
