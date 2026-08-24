@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -13,6 +14,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/segmentio/kafka-go"
 )
+
+const maxProcessingAttempts = 3
 
 type ShipmentCreatedPayload struct {
 	Origin      string  `json:"origin"`
@@ -92,6 +95,17 @@ type MessageCommitter interface {
 	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
 }
 
+type RetryBackoff interface {
+	Wait(attempt int)
+}
+
+type ExponentialBackoff struct{}
+
+func (ExponentialBackoff) Wait(attempt int) {
+	delay := time.Second * time.Duration(1<<(attempt-1))
+	time.Sleep(delay)
+}
+
 // DeadLetterPublisher abstracts publication of messages that cannot be
 // processed successfully and should leave the normal consumer flow.
 type DeadLetterPublisher interface {
@@ -157,6 +171,18 @@ func (p *KafkaDeadLetterPublisher) PublishDeadLetter(
 
 func (p *KafkaDeadLetterPublisher) Close() error {
 	return p.writer.Close()
+}
+
+type PermanentProcessingError struct {
+	Err error
+}
+
+func (e *PermanentProcessingError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *PermanentProcessingError) Unwrap() error {
+	return e.Err
 }
 
 // OutboxStore abstracts pending event retrieval and publication tracking,
@@ -388,11 +414,15 @@ func closestUnvisitedCity(
 // It also reconstructs the ordered path from origin to destination.
 func shortestPath(graph Graph, origin, destination string) ([]string, float64, error) {
 	if _, exists := graph[origin]; !exists {
-		return nil, 0, fmt.Errorf("origin city %s does not exist", origin)
+		return nil, 0, &PermanentProcessingError{
+			Err: fmt.Errorf("origin city %s does not exist", origin),
+		}
 	}
 
 	if _, exists := graph[destination]; !exists {
-		return nil, 0, fmt.Errorf("destination city %s does not exist", destination)
+		return nil, 0, &PermanentProcessingError{
+			Err: fmt.Errorf("destination city %s does not exist", destination),
+		}
 	}
 
 	distances := make(map[string]float64)
@@ -430,11 +460,13 @@ func shortestPath(graph Graph, origin, destination string) ([]string, float64, e
 	}
 
 	if math.IsInf(distances[destination], 1) {
-		return nil, 0, fmt.Errorf(
-			"no route found from %s to %s",
-			origin,
-			destination,
-		)
+		return nil, 0, &PermanentProcessingError{
+			Err: fmt.Errorf(
+				"no route found from %s to %s",
+				origin,
+				destination,
+			),
+		}
 	}
 
 	path := []string{}
@@ -527,6 +559,48 @@ func processShipment(
 	return nil
 }
 
+func shouldRetry(err error) bool {
+	var permanentErr *PermanentProcessingError
+	return !errors.As(err, &permanentErr)
+}
+
+func processShipmentWithRetry(
+	graph Graph,
+	event ShipmentCreatedEvent,
+	store ProcessedEventStore,
+	maxAttempts int,
+	backoff RetryBackoff,
+) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := processShipment(
+			graph,
+			event,
+			store,
+		); err != nil {
+			if !shouldRetry(err) {
+				return err
+			}
+
+			if attempt < maxAttempts {
+				backoff.Wait(attempt)
+			}
+
+			lastErr = err
+			continue
+		}
+
+		return nil
+	}
+
+	return lastErr
+}
+
+// handleKafkaMessage processes a single Kafka message.
+// Transient failures use bounded retries with exponential backoff.
+// Permanent failures skip retries. Permanent failures and exhausted retries
+// are published to the DLQ before the original Kafka offset is committed.
 func handleKafkaMessage(
 	ctx context.Context,
 	message kafka.Message,
@@ -534,6 +608,7 @@ func handleKafkaMessage(
 	store ProcessedEventStore,
 	committer MessageCommitter,
 	deadLetterPublisher DeadLetterPublisher,
+	backoff RetryBackoff,
 ) error {
 	var event ShipmentCreatedEvent
 
@@ -554,15 +629,32 @@ func handleKafkaMessage(
 		return committer.CommitMessages(ctx, message)
 	}
 
-	// Commit the Kafka offset only after the event has been processed successfully.
-	// If processing fails, leaving the offset uncommitted allows Kafka to redeliver
-	// the message; persistent event-id idempotency makes that redelivery safe.
-	if err := processShipment(
+	// Processing must reach a terminal outcome before the Kafka offset is committed:
+	// either successful processing or successful publication to the DLQ.
+	// If DLQ publication fails, the offset remains uncommitted so Kafka can redeliver.
+	if err := processShipmentWithRetry(
 		graph,
 		event,
 		store,
+		maxProcessingAttempts,
+		backoff,
 	); err != nil {
-		return err
+		reason := "processing retries exhausted"
+
+		var permanentErr *PermanentProcessingError
+		if errors.As(err, &permanentErr) {
+			reason = "permanent processing failure"
+		}
+
+		if dlqErr := deadLetterPublisher.PublishDeadLetter(
+			ctx,
+			message,
+			reason,
+		); dlqErr != nil {
+			return fmt.Errorf("publish dead-letter message: %w", dlqErr)
+		}
+
+		return committer.CommitMessages(ctx, message)
 	}
 
 	return committer.CommitMessages(ctx, message)
@@ -644,6 +736,7 @@ func main() {
 			store,
 			reader,
 			deadLetterPublisher,
+			ExponentialBackoff{},
 		); err != nil {
 			fmt.Println("Error handling Kafka message:", err)
 			continue

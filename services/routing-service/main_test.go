@@ -31,6 +31,8 @@ type FakeProcessedEventStore struct {
 	processed    bool
 	outboxEvents []RouteCalculatedEvent
 	markErr      error
+	markErrors   []error
+	markCalls    int
 }
 
 func (s *FakeProcessedEventStore) IsProcessed(eventID string) (bool, error) {
@@ -41,6 +43,17 @@ func (s *FakeProcessedEventStore) MarkProcessedWithOutboxEvent(
 	eventID string,
 	outboxEvent RouteCalculatedEvent,
 ) error {
+	s.markCalls++
+
+	if len(s.markErrors) > 0 {
+		err := s.markErrors[0]
+		s.markErrors = s.markErrors[1:]
+
+		if err != nil {
+			return err
+		}
+	}
+
 	if s.markErr != nil {
 		return s.markErr
 	}
@@ -104,6 +117,14 @@ func (p *FakeDeadLetterPublisher) PublishDeadLetter(
 	p.PublishedMessages = append(p.PublishedMessages, message)
 	p.Reasons = append(p.Reasons, reason)
 	return nil
+}
+
+type FakeRetryBackoff struct {
+	Attempts []int
+}
+
+func (b *FakeRetryBackoff) Wait(attempt int) {
+	b.Attempts = append(b.Attempts, attempt)
 }
 
 func TestShortestPathMadridToBilbao(t *testing.T) {
@@ -173,18 +194,25 @@ func TestShortestPathDestinationDoesNotExist(t *testing.T) {
 	}
 }
 
-func TestShortestPathNoRouteExists(t *testing.T) {
+func TestShortestPathNoRouteReturnsPermanentProcessingError(t *testing.T) {
 	graph := make(Graph)
 
 	addUndirectedEdge(graph, "Madrid", "Zaragoza", 320)
-
-	// Bilbao exists in the graph, but it is disconnected.
 	graph["Bilbao"] = []Edge{}
 
 	_, _, err := shortestPath(graph, "Madrid", "Bilbao")
 
 	if err == nil {
 		t.Fatal("expected an error, got nil")
+	}
+
+	var permanentErr *PermanentProcessingError
+
+	if !errors.As(err, &permanentErr) {
+		t.Fatalf(
+			"expected PermanentProcessingError, got %T",
+			err,
+		)
 	}
 }
 
@@ -461,6 +489,7 @@ func TestHandleKafkaMessageCommitsIgnoredEvent(t *testing.T) {
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 	if err != nil {
 		t.Fatalf("expected ignored event to be handled successfully, got %v", err)
@@ -520,6 +549,7 @@ func TestHandleKafkaMessageCommitsSuccessfullyProcessedShipment(t *testing.T) {
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 	if err != nil {
 		t.Fatalf("expected message to be handled successfully, got %v", err)
@@ -565,7 +595,7 @@ func (s *FailingProcessedEventStore) MarkProcessedWithOutboxEvent(
 	return s.ProcessErr
 }
 
-func TestHandleKafkaMessageDoesNotCommitWhenProcessingFails(t *testing.T) {
+func TestHandleKafkaMessageDoesNotCommitWhenRetriesExhaustedAndDeadLetterFails(t *testing.T) {
 	graph := buildGraph()
 
 	store := &FailingProcessedEventStore{
@@ -573,7 +603,10 @@ func TestHandleKafkaMessageDoesNotCommitWhenProcessingFails(t *testing.T) {
 	}
 
 	committer := &FakeMessageCommitter{}
-	deadLetterPublisher := &FakeDeadLetterPublisher{}
+
+	deadLetterPublisher := &FakeDeadLetterPublisher{
+		Err: errors.New("dlq unavailable"),
+	}
 
 	event := ShipmentCreatedEvent{
 		EventID:    "evt_shipment_456",
@@ -607,10 +640,18 @@ func TestHandleKafkaMessageDoesNotCommitWhenProcessingFails(t *testing.T) {
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 
 	if err == nil {
 		t.Fatal("expected message handling to fail")
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 0 {
+		t.Fatalf(
+			"expected no successful dead-letter publications, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
 	}
 
 	if len(committer.CommittedMessages) != 0 {
@@ -663,6 +704,7 @@ func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 
 	if err == nil {
@@ -688,6 +730,7 @@ func TestHandleKafkaMessageCanRetryCommitAfterProcessingSucceeds(t *testing.T) {
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 	if err != nil {
 		t.Fatalf("expected redelivery to succeed, got %v", err)
@@ -727,6 +770,7 @@ func TestHandleKafkaMessageSendsMalformedJSONToDeadLetterAndCommits(t *testing.T
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 
 	if err != nil {
@@ -794,6 +838,7 @@ func TestHandleKafkaMessageDoesNotCommitWhenDeadLetterPublicationFails(t *testin
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 
 	if err == nil {
@@ -840,6 +885,7 @@ func TestHandleKafkaMessageCanRepublishDeadLetterAfterCommitFailure(t *testing.T
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 
 	if err == nil {
@@ -870,6 +916,7 @@ func TestHandleKafkaMessageCanRepublishDeadLetterAfterCommitFailure(t *testing.T
 		store,
 		committer,
 		deadLetterPublisher,
+		ExponentialBackoff{},
 	)
 
 	if err != nil {
@@ -888,5 +935,298 @@ func TestHandleKafkaMessageCanRepublishDeadLetterAfterCommitFailure(t *testing.T
 			"expected 1 successful commit, got %d",
 			len(committer.CommittedMessages),
 		)
+	}
+}
+
+func TestHandleKafkaMessageRetriesTransientProcessingFailure(t *testing.T) {
+	graph := buildGraph()
+
+	store := &FakeProcessedEventStore{
+		markErrors: []error{
+			errors.New("database temporarily unavailable"),
+			nil,
+		},
+	}
+
+	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
+	backoff := &FakeRetryBackoff{}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_retry_001",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_retry_001",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    32,
+		Value:     value,
+	}
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+		backoff,
+	)
+
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got %v", err)
+	}
+
+	if store.markCalls != 2 {
+		t.Fatalf(
+			"expected 2 processing attempts, got %d",
+			store.markCalls,
+		)
+	}
+
+	if len(store.outboxEvents) != 1 {
+		t.Fatalf(
+			"expected 1 outbox event, got %d",
+			len(store.outboxEvents),
+		)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 0 {
+		t.Fatalf(
+			"expected no dead-letter messages, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if !reflect.DeepEqual(backoff.Attempts, []int{1}) {
+		t.Fatalf(
+			"expected backoff after attempt 1, got %v",
+			backoff.Attempts,
+		)
+	}
+}
+
+func TestHandleKafkaMessageSendsToDeadLetterAfterRetriesExhausted(t *testing.T) {
+	graph := buildGraph()
+
+	store := &FakeProcessedEventStore{
+		markErrors: []error{
+			errors.New("database temporarily unavailable"),
+			errors.New("database temporarily unavailable"),
+			errors.New("database temporarily unavailable"),
+		},
+	}
+
+	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
+	backoff := &FakeRetryBackoff{}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_retry_exhausted_001",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_retry_exhausted_001",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Madrid",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    33,
+		Value:     value,
+	}
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+		backoff,
+	)
+
+	if err != nil {
+		t.Fatalf("expected exhausted retries to be handled through DLQ, got %v", err)
+	}
+
+	if store.markCalls != 3 {
+		t.Fatalf(
+			"expected 3 processing attempts, got %d",
+			store.markCalls,
+		)
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter publication, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	if len(store.outboxEvents) != 0 {
+		t.Fatalf(
+			"expected no outbox events after exhausted retries, got %d",
+			len(store.outboxEvents),
+		)
+	}
+
+	if !reflect.DeepEqual(backoff.Attempts, []int{1, 2}) {
+		t.Fatalf(
+			"expected backoff after attempts 1 and 2, got %v",
+			backoff.Attempts,
+		)
+	}
+
+	if len(deadLetterPublisher.Reasons) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter reason, got %d",
+			len(deadLetterPublisher.Reasons),
+		)
+	}
+
+	if deadLetterPublisher.Reasons[0] != "processing retries exhausted" {
+		t.Fatalf(
+			"expected retries exhausted reason, got %q",
+			deadLetterPublisher.Reasons[0],
+		)
+	}
+}
+
+func TestHandleKafkaMessageSendsPermanentProcessingErrorToDeadLetter(t *testing.T) {
+	graph := buildGraph()
+	store := &FakeProcessedEventStore{}
+	committer := &FakeMessageCommitter{}
+	deadLetterPublisher := &FakeDeadLetterPublisher{}
+	backoff := &FakeRetryBackoff{}
+
+	event := ShipmentCreatedEvent{
+		EventID:    "evt_permanent_001",
+		EventType:  "ShipmentCreated",
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		ShipmentID: "shp_permanent_001",
+		Payload: ShipmentCreatedPayload{
+			Origin:      "Atlantis",
+			Destination: "Bilbao",
+			Weight:      15,
+			Priority:    "HIGH",
+		},
+	}
+
+	value, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+
+	message := kafka.Message{
+		Topic:     "shipment-events",
+		Partition: 0,
+		Offset:    34,
+		Value:     value,
+	}
+
+	err = handleKafkaMessage(
+		context.Background(),
+		message,
+		graph,
+		store,
+		committer,
+		deadLetterPublisher,
+		backoff,
+	)
+
+	if err != nil {
+		t.Fatalf("expected permanent error to be handled through DLQ, got %v", err)
+	}
+
+	if len(deadLetterPublisher.PublishedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter publication, got %d",
+			len(deadLetterPublisher.PublishedMessages),
+		)
+	}
+
+	if len(committer.CommittedMessages) != 1 {
+		t.Fatalf(
+			"expected 1 committed message, got %d",
+			len(committer.CommittedMessages),
+		)
+	}
+
+	if len(deadLetterPublisher.Reasons) != 1 {
+		t.Fatalf(
+			"expected 1 dead-letter reason, got %d",
+			len(deadLetterPublisher.Reasons),
+		)
+	}
+
+	if deadLetterPublisher.Reasons[0] != "permanent processing failure" {
+		t.Fatalf(
+			"expected permanent processing failure reason, got %q",
+			deadLetterPublisher.Reasons[0],
+		)
+	}
+
+	if len(backoff.Attempts) != 0 {
+		t.Fatalf(
+			"expected no retry backoff for permanent error, got %v",
+			backoff.Attempts,
+		)
+	}
+}
+
+func TestShouldRetryReturnsFalseForPermanentProcessingError(t *testing.T) {
+	err := &PermanentProcessingError{
+		Err: errors.New("origin city Atlantis does not exist"),
+	}
+
+	if shouldRetry(err) {
+		t.Fatal("expected permanent processing error not to be retryable")
+	}
+}
+
+func TestShouldRetryReturnsTrueForTransientError(t *testing.T) {
+	err := errors.New("database temporarily unavailable")
+
+	if !shouldRetry(err) {
+		t.Fatal("expected transient error to be retryable")
 	}
 }
