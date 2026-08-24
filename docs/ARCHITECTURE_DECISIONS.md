@@ -1342,10 +1342,15 @@ commit processed event + ETAPredicted outbox event in PostgreSQL
 commit Kafka offset
 ```
 
-The consumed Kafka offset is committed only after application processing has
-completed successfully and the PostgreSQL transaction has committed.
+The consumed Kafka offset is committed only after the message reaches a terminal
+outcome: either application processing completes successfully and the PostgreSQL
+transaction commits, or the message is successfully published to the Prediction
+Service dead-letter topic.
 
-If decoding, validation, or processing fails, the offset is not committed.
+Malformed JSON and invalid `RouteCalculated` events rejected by Pydantic are treated
+as terminal input failures and sent directly to the DLQ. Other processing failures
+follow the bounded retry policy defined in ADR-026. If DLQ publication fails, the
+original offset is not committed.
 
 If the offset commit fails after PostgreSQL processing succeeds, Kafka may
 redeliver the same message. Persistent `event_id`-based idempotency makes that
@@ -1369,9 +1374,10 @@ the Kafka offset commit fails afterwards.
 That duplicate delivery is intentionally accepted because Prediction Service
 already provides persistent consumer idempotency.
 
-Malformed or invalid `RouteCalculated` events are deliberately not committed
-with the current behavior. Without retry limits or a dead-letter strategy, such
-messages can therefore be redelivered indefinitely.
+Dead-letter publication introduces another Kafka write before the original offset
+can be committed. If DLQ publication succeeds but the later offset commit fails,
+Kafka may redeliver the original message and a duplicate dead-letter record may be
+published. This at-least-once DLQ behavior is intentionally accepted for the MVP.
 
 ### Alternatives considered
 
@@ -1384,29 +1390,35 @@ messages can therefore be redelivered indefinitely.
 
 ### Consequences
 
-Prediction Service now prefers possible redelivery over silently losing an
-unprocessed `RouteCalculated` event.
+Prediction Service now commits consumed offsets only after successful processing
+or successful dead-letter publication.
 
 The main failure windows become:
 
 ``` text
-processing fails
-→ no offset commit
-→ Kafka may redeliver
-
 processing succeeds
 → offset commit fails
 → Kafka may redeliver
 → persistent idempotency prevents duplicate business effects
+
+DLQ publication fails
+→ no original offset commit
+→ Kafka may redeliver
+
+DLQ publication succeeds
+→ original offset commit fails
+→ Kafka may redeliver
+→ duplicate DLQ publication is possible
 ```
 
 Unit tests verify that:
 
 -   ignored event types are committed;
 -   successfully processed `RouteCalculated` events are committed;
--   failed processing does not commit the offset;
 -   a commit failure after successful processing can be retried safely without
-    generating another outbox event.
+    generating another outbox event;
+-   successful dead-letter publication is followed by an offset commit;
+-   failed dead-letter publication does not commit the original message.
 
 The happy path and failed-processing redelivery behavior were also verified
 manually with Kafka and PostgreSQL running.
@@ -1580,6 +1592,170 @@ Unit tests verify that:
 **Related decisions:** ADR-017, ADR-018, ADR-020, ADR-023
 
 
+------------------------------------------------------------------------
+
+## ADR-026 --- Define explicit retry and dead-letter semantics for Prediction Service
+
+**Status:** Accepted\
+**Stage:** Prediction Service consumer failure handling
+
+### Context
+
+Prediction Service can fail while consuming a `RouteCalculated` event for reasons
+with different recovery characteristics.
+
+Some failures are terminal for the current message. Malformed JSON cannot become
+valid by retrying, and a `RouteCalculated` event rejected by Pydantic will continue
+to violate the service's input contract if the same payload is processed again.
+
+Other failures may be transient. For example, a temporary PostgreSQL failure may
+succeed if the same processing operation is attempted again.
+
+Treating every failure identically would either retry invalid inputs unnecessarily
+or move recoverable processing failures to the dead-letter topic too early. The
+consumer also needs bounded failure handling so repeatedly failing messages cannot
+block progress indefinitely.
+
+### Decision
+
+Prediction Service applies an explicit terminal-versus-retryable failure policy.
+
+Malformed JSON is treated as a terminal input failure and is sent directly to the
+dedicated `prediction-service-dlq` topic.
+
+`RouteCalculated` events that fail Pydantic validation are also terminal input
+failures. They skip processing retries and are sent directly to the DLQ.
+
+Other processing failures are treated as transient. Prediction Service performs a
+maximum of three processing attempts using exponential backoff between attempts.
+
+For the current policy:
+
+``` text
+attempt 1 fails
+→ wait 1 second
+
+attempt 2 fails
+→ wait 2 seconds
+
+attempt 3 fails
+→ retries exhausted
+→ publish to DLQ
+```
+
+No backoff occurs after the final attempt because no further processing attempt
+will be made.
+
+The resulting failure paths are:
+
+``` text
+malformed JSON
+→ DLQ
+
+invalid RouteCalculated event
+→ no retry
+→ DLQ
+
+transient processing failure
+→ bounded retries
+→ exponential backoff
+→ retries exhausted
+→ DLQ
+```
+
+Dead-letter records preserve diagnostic context including the original topic,
+partition, offset, payload, failure reason, and failure timestamp.
+
+The original Kafka offset is committed only after the message reaches a terminal
+outcome:
+
+``` text
+successful processing
+→ commit original Kafka offset
+
+successful DLQ publication
+→ commit original Kafka offset
+```
+
+If DLQ publication fails, the original offset remains uncommitted so Kafka may
+redeliver the message.
+
+If DLQ publication succeeds but the subsequent offset commit fails, Kafka may
+redeliver the message and Prediction Service may publish another dead-letter
+record. Duplicate DLQ records are intentionally accepted for the MVP.
+
+Retry waiting is abstracted behind `RetryBackoff`, and dead-letter publication
+behind `DeadLetterPublisher`, allowing consumer failure behavior to be tested
+without waiting for real retry delays or requiring a running Kafka broker.
+
+### Trade-off
+
+The current policy deliberately uses a simple failure taxonomy. JSON decoding and
+Pydantic validation failures are terminal, while other processing exceptions are
+retryable. If additional deterministic domain failures appear later, the taxonomy
+may need to become more explicit.
+
+Bounded retries introduce additional processing latency during transient failures.
+
+Publishing to a DLQ creates another Kafka write and another partial-failure
+boundary. DLQ delivery therefore remains at-least-once rather than exactly-once,
+and duplicate dead-letter records must be tolerated.
+
+The retry parameters are intentionally simple and local to Prediction Service.
+More advanced policies such as jitter, configurable retry budgets, or
+failure-specific retry strategies are deferred until concrete requirements justify
+them.
+
+### Alternatives considered
+
+-   Retry every failure, including malformed or invalid events.
+-   Send every processing failure directly to the DLQ.
+-   Leave failed messages uncommitted and allow indefinite Kafka redelivery.
+-   Use fixed-delay retries instead of exponential backoff.
+-   Retry indefinitely rather than using a bounded attempt count.
+-   Commit invalid messages and discard them without preserving diagnostic
+    information.
+-   Commit the original offset before publishing to the DLQ.
+-   Add idempotent or exactly-once dead-letter publication in the MVP.
+
+### Consequences
+
+Prediction Service avoids pointless retries for malformed and contract-invalid
+inputs while still allowing transient processing failures to recover locally.
+
+Repeated transient failures are bounded and eventually moved to the DLQ, allowing
+the consumer to make progress.
+
+The important terminal failure windows are:
+
+``` text
+DLQ publication fails
+→ no original offset commit
+→ Kafka may redeliver
+
+DLQ publication succeeds
+→ original offset commit fails
+→ Kafka may redeliver
+→ duplicate DLQ publication is possible
+```
+
+Unit tests verify that:
+
+-   malformed JSON is published directly to the DLQ;
+-   invalid `RouteCalculated` events are published directly to the DLQ;
+-   failed DLQ publication does not commit the original message;
+-   a commit failure after successful DLQ publication can produce another DLQ
+    record on redelivery;
+-   transient processing failures are retried;
+-   exponential backoff occurs only between attempts;
+-   processing can recover on a later retry;
+-   exhausted transient failures are published to the DLQ;
+-   dead-letter records preserve the original Kafka context, failure reason, and
+    failure timestamp.
+
+**Related decisions:** ADR-020, ADR-021, ADR-022, ADR-024
+
+
 # Known Technical Debt
 
 ## TD-001 --- Non-atomic PostgreSQL + Kafka writes
@@ -1727,29 +1903,32 @@ consumers make it necessary.
 
 ## TD-009 --- Consumer retry and dead-letter semantics are only partially defined
 
+**Status:** Resolved\
 **Area:** Event processing reliability\
 **Priority:** High
 
-**Current limitation:**\
-Routing Service now has an explicit consumer failure policy. Malformed JSON and
-permanent processing failures are sent directly to `routing-service-dlq`.
-Transient processing failures use a maximum of three attempts with exponential
-backoff, and exhausted failures are also sent to the DLQ.
+**Original limitation:**\
+Routing Service had an explicit consumer failure policy, but Prediction Service did
+not yet implement equivalent bounded retry, exponential backoff, and dead-letter
+handling. Invalid or repeatedly failing Prediction messages could therefore rely on
+unbounded Kafka redelivery rather than an explicit terminal failure path.
 
-The original Kafka offset is committed only after successful processing or
-successful dead-letter publication. Failed DLQ publication leaves the offset
-uncommitted so Kafka can redeliver the message.
+**Resolution:**\
+Both Routing Service and Prediction Service now implement bounded consumer failure
+handling with a maximum of three processing attempts and exponential backoff for
+retryable failures.
 
-Prediction Service does not yet implement the equivalent permanent/transient
-failure classification, bounded retry, exponential backoff, and dead-letter
-policy.
+Malformed JSON is sent directly to each service's dedicated DLQ. Routing also sends
+known deterministic `PermanentProcessingError` failures directly to its DLQ, while
+Prediction sends `RouteCalculated` events rejected by Pydantic directly to its DLQ.
 
-**Planned evolution:**\
-Extend Routing Service's consumer failure policy to Prediction Service while
-preserving the current explicit offset-commit, at-least-once delivery, and
-persistent idempotency guarantees.
+In both services, exhausted retryable failures are dead-lettered. The original
+Kafka offset is committed only after successful processing or successful DLQ
+publication. Failed DLQ publication leaves the original offset uncommitted, while a
+commit failure after successful DLQ publication may produce a duplicate dead-letter
+record on redelivery.
 
-**Related decisions:** ADR-023, ADR-024, ADR-025
+**Related decisions:** ADR-023, ADR-024, ADR-025, ADR-026
 
 ------------------------------------------------------------------------
 
@@ -1785,16 +1964,16 @@ downstream services process events. A generic update API or state
 machine has not been introduced yet because no current service requires
 it.
 
-## Retry and dead-letter strategy
+## Advanced retry and dead-letter strategy
 
-Routing Service now implements explicit permanent/transient failure
-classification, bounded retries with exponential backoff, and dead-letter
-handling.
+Routing Service and Prediction Service now implement explicit bounded retries with
+exponential backoff and service-specific dead-letter handling. Both commit the
+original Kafka offset only after successful processing or successful DLQ
+publication.
 
-The equivalent policy for Prediction Service remains intentionally deferred
-until it is implemented there. More advanced retry behavior such as jitter,
-configurable retry budgets, or failure-specific retry policies is also deferred
-until concrete operational requirements justify the added complexity.
+More advanced retry behavior such as jitter, configurable retry budgets,
+failure-specific retry policies, or stronger DLQ deduplication guarantees remains
+deferred until concrete operational requirements justify the added complexity.
 
 ## Observability and distributed tracing
 
