@@ -275,6 +275,9 @@ PostgreSQL-specific behavior is covered separately by integration tests, includi
 | `ShipmentCreated` consumption | Implemented |
 | Routing consumer idempotency | Implemented |
 | Routing explicit Kafka offset commits | Implemented |
+| Routing permanent/transient failure classification | Implemented |
+| Routing bounded retries with exponential backoff | Implemented |
+| Routing dead-letter handling | Implemented |
 | Routing transactional outbox | Implemented |
 | `RouteCalculated` publication | Implemented |
 | Routing PostgreSQL integration tests | Implemented |
@@ -310,14 +313,16 @@ Order Service
 
 The Order → Routing → Prediction flow is implemented. Both Routing and Prediction now provide persistent consumer idempotency and transactional outbox publication with at-least-once delivery semantics.
 
-Both Routing and Prediction now use explicit Kafka offset commits. A consumed event is committed only after successful processing and durable PostgreSQL persistence. If the offset commit fails after processing succeeds, persistent `event_id`-based idempotency makes redelivery safe.
+Both Routing and Prediction use explicit Kafka offset commits. A consumed event is committed only after successful processing and durable PostgreSQL persistence. If the offset commit fails after processing succeeds, persistent `event_id`-based idempotency makes redelivery safe.
 
-Routing Service now sends malformed JSON directly to `routing-service-dlq` and commits the original Kafka offset only after the dead-letter publication succeeds. If dead-letter publication fails, the original offset remains uncommitted; if the later offset commit fails, redelivery may produce a duplicate dead-letter record, which is intentionally accepted as at-least-once DLQ delivery.
+Routing Service now applies an explicit consumer failure policy. Malformed JSON and permanent processing failures are sent directly to `routing-service-dlq` without retrying. Transient processing failures use bounded retries with exponential backoff; if all attempts are exhausted, the original message is sent to the DLQ.
 
-The next reliability milestone is to add retry and backoff behavior for transient Routing failures, then extend the same permanent/transient failure policy to Prediction Service.
+The original Kafka offset is committed only after processing reaches a terminal outcome: either successful processing or successful dead-letter publication. If DLQ publication fails, the original offset remains uncommitted so Kafka can redeliver the message. If DLQ publication succeeds but the later offset commit fails, redelivery may produce a duplicate dead-letter record, which is intentionally accepted as at-least-once DLQ delivery.
+
+The next reliability milestone is to extend the same permanent/transient failure classification, bounded retry, exponential backoff, and dead-letter policy to Prediction Service.
 
 ## Architecture Decisions
 
 Architecture decisions, trade-offs, known technical debt, and intentionally deferred improvements are documented separately in [`docs/ARCHITECTURE_DECISIONS.md`](docs/ARCHITECTURE_DECISIONS.md).
 
-This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in both consumers, Routing dead-letter handling for malformed JSON, and the remaining work around transient retries/backoff and Prediction dead-letter handling.
+This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in both consumers, Routing permanent/transient failure classification, bounded retries with exponential backoff, dead-letter handling, and the remaining work to extend the same consumer failure policy to Prediction Service.

@@ -1413,92 +1413,150 @@ manually with Kafka and PostgreSQL running.
 
 ------------------------------------------------------------------------
 
-## ADR-025 --- Send permanently invalid Routing messages to a dead-letter topic
+## ADR-025 --- Define explicit retry and dead-letter semantics for Routing Service
 
 **Status:** Accepted\
 **Stage:** Routing Service consumer failure handling
 
 ### Context
 
-Routing Service can receive messages that cannot become valid through
-redelivery. A malformed JSON payload is a permanent input failure: retrying the
-same bytes will produce the same decoding error.
+Routing Service can fail while consuming a `ShipmentCreated` event for reasons
+with different recovery characteristics.
 
-Leaving such a message uncommitted indefinitely would cause repeated delivery
-without giving the consumer a path to make progress.
+Some failures are permanent for the current message. Retrying the same input
+cannot change the outcome. Examples include malformed JSON, unknown route
+endpoints, or a valid pair of endpoints for which no route exists.
 
-At the same time, committing the original Kafka offset before preserving the
-failed message would create a loss window if dead-letter publication failed.
+Other failures may be transient. For example, a temporary PostgreSQL failure may
+succeed if the same processing operation is attempted again.
+
+Treating every failure identically would either cause permanently invalid
+messages to be retried unnecessarily or cause recoverable failures to be sent
+to the dead-letter topic too early.
+
+The consumer also needs bounded failure handling so that repeatedly failing
+messages cannot block progress indefinitely.
 
 ### Decision
 
-Treat malformed JSON received by Routing Service as a permanent failure and
-publish it to the dedicated `routing-service-dlq` topic.
+Classify Routing Service consumer failures as either permanent or transient.
 
-The dead-letter record preserves diagnostic context including the original
-topic, partition, offset, payload, failure reason, and failure timestamp.
+Malformed JSON is treated as a permanent input failure and is sent directly to
+the dedicated `routing-service-dlq` topic.
 
-The processing order is:
+Processing failures that are known to be deterministic for the current event
+are represented as `PermanentProcessingError`. These failures skip retries and
+are sent directly to the DLQ.
+
+Other processing failures are treated as transient. Routing Service performs a
+maximum of three processing attempts using exponential backoff between attempts.
+
+For the current policy:
 
 ``` text
-receive message
-decode JSON
-decoding fails
-publish dead-letter record
-commit original Kafka offset
+attempt 1 fails
+→ wait 1 second
+
+attempt 2 fails
+→ wait 2 seconds
+
+attempt 3 fails
+→ retries exhausted
+→ publish to DLQ
 ```
 
-The original offset is committed only after dead-letter publication succeeds.
+No backoff occurs after the final attempt because no further processing attempt
+will be made.
 
-If dead-letter publication fails, the original offset is not committed and
-Kafka may redeliver the message.
+The resulting failure paths are:
 
-If dead-letter publication succeeds but the original offset commit fails, Kafka
-may redeliver the message and Routing Service may publish another dead-letter
-record. Duplicate dead-letter records are intentionally accepted for the MVP.
+``` text
+malformed JSON
+→ DLQ
 
-Dead-letter publication is abstracted behind `DeadLetterPublisher`, allowing
-consumer behavior to be tested without a running Kafka broker.
+permanent processing failure
+→ no retry
+→ DLQ
 
-This decision currently applies only to malformed JSON in Routing Service.
-Transient processing failures and other permanent failure categories are handled
-separately as the retry policy evolves.
+transient processing failure
+→ bounded retries
+→ exponential backoff
+→ retries exhausted
+→ DLQ
+```
+
+Dead-letter records preserve diagnostic context including the original topic,
+partition, offset, payload, failure reason, and failure timestamp.
+
+The original Kafka offset is committed only after the message reaches a terminal
+outcome:
+
+``` text
+successful processing
+→ commit original Kafka offset
+
+successful DLQ publication
+→ commit original Kafka offset
+```
+
+If DLQ publication fails, the original offset remains uncommitted so Kafka may
+redeliver the message.
+
+If DLQ publication succeeds but the subsequent offset commit fails, Kafka may
+redeliver the message and Routing Service may publish another dead-letter
+record. Duplicate DLQ records are intentionally accepted for the MVP.
+
+Retry waiting is abstracted behind `RetryBackoff`, and dead-letter publication
+behind `DeadLetterPublisher`, allowing consumer failure behavior to be tested
+without waiting for real retry delays or requiring a running Kafka broker.
 
 ### Trade-off
 
-Publishing to a DLQ introduces another Kafka write and another partial-failure
-boundary.
+The failure taxonomy requires the application to decide which failures are
+permanent and which are retryable. Incorrect classification can either waste
+retry attempts or prematurely dead-letter a recoverable message.
 
-The DLQ therefore has at-least-once rather than exactly-once delivery semantics.
-Operators or future tooling consuming the DLQ must tolerate duplicate records.
+Bounded retries also introduce additional processing latency during transient
+failures.
 
-The current implementation also classifies only malformed JSON as a permanent
-failure. A broader failure taxonomy is intentionally deferred until the retry
-and validation behavior is implemented.
+Publishing to a DLQ creates another Kafka write and another partial-failure
+boundary. DLQ delivery therefore remains at-least-once rather than exactly-once,
+and duplicate dead-letter records must be tolerated.
+
+The current retry parameters are intentionally simple and local to Routing
+Service. More advanced policies such as jitter, configurable retry budgets, or
+different retry strategies by failure category are deferred until concrete
+requirements justify them.
 
 ### Alternatives considered
 
--   Leave malformed messages uncommitted and allow indefinite redelivery.
--   Commit malformed messages and discard them without preserving diagnostic
+-   Retry every processing failure.
+-   Send every processing failure directly to the DLQ.
+-   Leave failed messages uncommitted and allow indefinite Kafka redelivery.
+-   Use fixed-delay retries instead of exponential backoff.
+-   Retry indefinitely rather than using a bounded attempt count.
+-   Commit failed messages and discard them without preserving diagnostic
     information.
 -   Commit the original offset before publishing to the DLQ.
 -   Add idempotent or exactly-once dead-letter publication in the MVP.
--   Send all processing failures directly to the DLQ without distinguishing
-    transient from permanent failures.
 
 ### Consequences
 
-Routing Service can make progress past malformed JSON without silently
-discarding the failed input.
+Routing Service can recover from transient processing failures without relying
+immediately on Kafka redelivery while avoiding pointless retries for known
+permanent failures.
 
-The important failure windows are:
+Repeated transient failures are bounded and eventually moved to the DLQ,
+allowing the consumer to make progress.
+
+The important terminal failure windows are:
 
 ``` text
-dead-letter publication fails
+DLQ publication fails
 → no original offset commit
 → Kafka may redeliver
 
-dead-letter publication succeeds
+DLQ publication succeeds
 → original offset commit fails
 → Kafka may redeliver
 → duplicate DLQ publication is possible
@@ -1506,13 +1564,21 @@ dead-letter publication succeeds
 
 Unit tests verify that:
 
--   malformed JSON is published to the DLQ and then committed;
--   the dead-letter reason identifies the failure as `invalid JSON`;
+-   malformed JSON is published directly to the DLQ;
 -   failed DLQ publication does not commit the original message;
--   a commit failure after successful DLQ publication can cause a duplicate DLQ
-    publication on redelivery.
+-   a commit failure after successful DLQ publication can produce another DLQ
+    record on redelivery;
+-   transient processing failures are retried;
+-   exponential backoff occurs only between attempts;
+-   processing can recover on a later retry;
+-   exhausted transient failures are published to the DLQ;
+-   permanent processing failures skip retries and are published directly to
+    the DLQ;
+-   permanent and exhausted-transient failures preserve distinct dead-letter
+    reasons.
 
-**Related decisions:** ADR-023
+**Related decisions:** ADR-017, ADR-018, ADR-020, ADR-023
+
 
 # Known Technical Debt
 
@@ -1665,27 +1731,27 @@ consumers make it necessary.
 **Priority:** High
 
 **Current limitation:**\
-Routing Service and Prediction Service explicitly commit Kafka offsets only
-after successful processing and durable PostgreSQL persistence.
+Routing Service now has an explicit consumer failure policy. Malformed JSON and
+permanent processing failures are sent directly to `routing-service-dlq`.
+Transient processing failures use a maximum of three attempts with exponential
+backoff, and exhausted failures are also sent to the DLQ.
 
-Routing Service now treats malformed JSON as a permanent failure, publishes it
-to `routing-service-dlq`, and commits the original offset only after dead-letter
-publication succeeds.
+The original Kafka offset is committed only after successful processing or
+successful dead-letter publication. Failed DLQ publication leaves the offset
+uncommitted so Kafka can redeliver the message.
 
-Transient Routing failures still do not have bounded retry or backoff behavior,
-and additional permanent failure categories have not yet been classified.
-Prediction Service does not yet implement the same dead-letter policy.
+Prediction Service does not yet implement the equivalent permanent/transient
+failure classification, bounded retry, exponential backoff, and dead-letter
+policy.
 
 **Planned evolution:**\
-Add bounded retries and backoff for transient Routing failures, route exhausted
-failures to the DLQ, and then extend the same permanent/transient failure policy
-to Prediction Service while preserving the current at-least-once and idempotency
-guarantees.
+Extend Routing Service's consumer failure policy to Prediction Service while
+preserving the current explicit offset-commit, at-least-once delivery, and
+persistent idempotency guarantees.
 
 **Related decisions:** ADR-023, ADR-024, ADR-025
 
 ------------------------------------------------------------------------
-
 
 ## TD-010 --- Prediction producer flushes synchronously per event
 
@@ -1721,10 +1787,14 @@ it.
 
 ## Retry and dead-letter strategy
 
-Routing Service now sends malformed JSON directly to a dedicated dead-letter
-topic. Bounded retries, backoff, exhausted transient failures, additional
-permanent failure categories, and the equivalent Prediction Service behavior
-remain intentionally deferred until those failure paths are implemented.
+Routing Service now implements explicit permanent/transient failure
+classification, bounded retries with exponential backoff, and dead-letter
+handling.
+
+The equivalent policy for Prediction Service remains intentionally deferred
+until it is implemented there. More advanced retry behavior such as jitter,
+configurable retry budgets, or failure-specific retry policies is also deferred
+until concrete operational requirements justify the added complexity.
 
 ## Observability and distributed tracing
 
