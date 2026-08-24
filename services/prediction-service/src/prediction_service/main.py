@@ -1,20 +1,25 @@
-import json
 import os
 import threading
 import time
 
 from confluent_kafka import Consumer
-from pydantic import ValidationError
 
-from prediction_service.models import RouteCalculatedEvent
-from prediction_service.publisher import EventPublisher, KafkaEventPublisher
-from prediction_service.prediction import handle_route_calculated
+from prediction_service.publisher import (
+    EventPublisher,
+    KafkaDeadLetterPublisher,
+    KafkaEventPublisher,
+)
 from prediction_service.store import PostgresPredictionStore
 from prediction_service.outbox import publish_pending_events
+from prediction_service.consumer import RetryBackoff, handle_kafka_message
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "shipment-events")
 KAFKA_GROUP_ID = "prediction-service"
+KAFKA_DLQ_TOPIC = os.getenv(
+    "KAFKA_DLQ_TOPIC",
+    "prediction-service-dlq",
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -44,46 +49,6 @@ def run_outbox_publisher(
         time.sleep(5)
 
 
-def handle_kafka_message(
-    message,
-    store: PostgresPredictionStore,
-    consumer: Consumer,
-) -> None:
-    try:
-        data = json.loads(message.value().decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        print(f"Invalid Kafka message, skipping: {exc}")
-        return
-
-    # Multiple event types share the topic; this service only handles RouteCalculated.
-    if data.get("event_type") != "RouteCalculated":
-        consumer.commit(message=message, asynchronous=False)
-        return
-
-    try:
-        event = RouteCalculatedEvent.model_validate(data)
-    except ValidationError as exc:
-        print(f"Invalid RouteCalculated event, skipping: {exc}")
-        return
-
-    eta_event = handle_route_calculated(
-        event,
-        store,
-    )
-
-    # Commit the Kafka offset only after processing has completed successfully.
-    # If the commit fails, persistent event-id idempotency makes redelivery safe.
-    consumer.commit(message=message, asynchronous=False)
-
-    if eta_event is None:
-        return
-
-    print(
-        f"ETA predicted and queued for shipment {eta_event.shipment_id}: "
-        f"{eta_event.payload.estimated_travel_minutes} minutes"
-    )
-
-
 def main():
     consumer = create_consumer()
     consumer.subscribe([KAFKA_TOPIC])
@@ -91,6 +56,11 @@ def main():
     publisher = KafkaEventPublisher(
         broker=KAFKA_BROKER,
         topic=KAFKA_TOPIC,
+    )
+
+    dead_letter_publisher = KafkaDeadLetterPublisher(
+        broker=KAFKA_BROKER,
+        topic=KAFKA_DLQ_TOPIC,
     )
 
     store = PostgresPredictionStore(DATABASE_URL)
@@ -117,6 +87,8 @@ def main():
                 message,
                 store,
                 consumer,
+                dead_letter_publisher,
+                RetryBackoff(),
             )
 
     finally:
