@@ -109,7 +109,7 @@ Define shipment persistence through the `ShipmentStore` interface.
 
 Current implementations:
 
-``` text
+```text
 ShipmentStore
 ├── InMemoryShipmentStore
 └── PostgresShipmentStore
@@ -161,7 +161,7 @@ Inject infrastructure dependencies into the router.
 
 Use lightweight test implementations:
 
-``` text
+```text
 Production                    Tests
 
 PostgresShipmentStore         InMemoryShipmentStore
@@ -208,7 +208,7 @@ data invariants with PostgreSQL constraints where appropriate.
 
 Examples currently enforced in PostgreSQL include:
 
-``` text
+```text
 weight > 0
 priority IN ('LOW', 'MEDIUM', 'HIGH')
 origin <> destination
@@ -326,7 +326,7 @@ support idempotent consumers.
 
 A shipment may eventually generate a sequence of related events:
 
-``` text
+```text
 ShipmentCreated
 RouteCalculated
 ETAPredicted
@@ -338,7 +338,7 @@ Kafka guarantees ordering within a partition.
 
 Publish shipment-related events using:
 
-``` text
+```text
 Kafka message key = shipment_id
 ```
 
@@ -365,7 +365,7 @@ preserved as the topic scales.
 
 Creating a shipment currently requires two independent operations:
 
-``` text
+```text
 1. Persist shipment in PostgreSQL.
 2. Publish ShipmentCreated to Kafka.
 ```
@@ -375,7 +375,7 @@ in the current design.
 
 The following failure was deliberately reproduced:
 
-``` text
+```text
 PostgreSQL INSERT       SUCCESS
 Kafka publish           FAILURE
 ```
@@ -404,7 +404,7 @@ successfully published.
 
 Therefore:
 
-``` text
+```text
 HTTP response: failure
 Database state: shipment exists
 Kafka state: event may be absent
@@ -434,7 +434,7 @@ result ambiguous.
 
 Deleting the shipment could therefore create the opposite inconsistency:
 
-``` text
+```text
 Kafka event exists
 PostgreSQL shipment does not exist
 ```
@@ -458,7 +458,7 @@ Introduce a **Transactional Outbox**.
 
 Conceptually:
 
-``` text
+```text
 BEGIN PostgreSQL transaction
 
 INSERT shipment
@@ -504,7 +504,7 @@ partitions between multiple instances of the same logical consumer.
 
 Routing Service consumes events using:
 
-``` text
+```text
 GroupID = routing-service
 ```
 
@@ -547,7 +547,7 @@ Consumer idempotency remains a separate reliability concern.
 
 The shipment lifecycle now contains multiple event types:
 
-``` text
+```text
 ShipmentCreated
 RouteCalculated
 ```
@@ -567,7 +567,7 @@ keep related shipment lifecycle events in a shared topic.
 
 For the current MVP, publish shipment lifecycle events to:
 
-``` text
+```text
 shipment-events
 ```
 
@@ -883,7 +883,7 @@ solve reliable downstream publication.
 Routing Service originally performed two independent operations after
 calculating a route:
 
-``` text
+```text
 1. Publish RouteCalculated to Kafka.
 2. Mark ShipmentCreated as processed in PostgreSQL.
 ```
@@ -904,7 +904,7 @@ Use a Transactional Outbox in Routing Service.
 
 Within one PostgreSQL transaction, Routing Service:
 
-``` text
+```text
 INSERT processed input event
 INSERT RouteCalculated outbox event
 COMMIT
@@ -968,7 +968,7 @@ processes pending outbox events sequentially.
 
 For each event it:
 
-``` text
+```text
 read pending outbox event
 publish RouteCalculated to Kafka
 mark the outbox event as published
@@ -1010,7 +1010,7 @@ Even with a Transactional Outbox, Kafka publication and updating
 
 The following failure remains possible:
 
-``` text
+```text
 Kafka publish                  SUCCESS
 Mark outbox event published   FAILURE
 ```
@@ -1130,7 +1130,7 @@ Use a Transactional Outbox in Prediction Service.
 
 Within one PostgreSQL transaction, Prediction Service:
 
-``` text
+```text
 INSERT processed RouteCalculated event
 INSERT ETAPredicted outbox event
 COMMIT
@@ -1194,7 +1194,7 @@ progress to advance before application processing has completed successfully.
 
 That creates an unsafe failure window:
 
-``` text
+```text
 Kafka delivers ShipmentCreated
 offset committed
 PostgreSQL processing fails
@@ -1206,7 +1206,7 @@ did not durably record the processed input event or create its corresponding
 
 The opposite order creates a safer failure mode:
 
-``` text
+```text
 Kafka delivers ShipmentCreated
 PostgreSQL processing succeeds
 offset commit fails
@@ -1224,7 +1224,7 @@ Routing Service fetches messages without automatically committing their offsets.
 
 For a `ShipmentCreated` event:
 
-``` text
+```text
 fetch message
 process event
 commit processed event + RouteCalculated outbox event in PostgreSQL
@@ -1276,7 +1276,7 @@ unprocessed message.
 
 The main failure windows become:
 
-``` text
+```text
 processing fails
 → no offset commit
 → Kafka may redeliver
@@ -1313,7 +1313,7 @@ consumer group.
 As with Routing Service, allowing Kafka offsets to advance independently from
 successful application processing creates an unsafe failure window:
 
-``` text
+```text
 Kafka delivers RouteCalculated
 offset committed
 PostgreSQL processing fails
@@ -1334,7 +1334,7 @@ explicitly.
 
 For a `RouteCalculated` event:
 
-``` text
+```text
 fetch message
 validate event
 process event
@@ -1395,7 +1395,7 @@ or successful dead-letter publication.
 
 The main failure windows become:
 
-``` text
+```text
 processing succeeds
 → offset commit fails
 → Kafka may redeliver
@@ -1465,7 +1465,7 @@ maximum of three processing attempts using exponential backoff between attempts.
 
 For the current policy:
 
-``` text
+```text
 attempt 1 fails
 → wait 1 second
 
@@ -1482,7 +1482,7 @@ will be made.
 
 The resulting failure paths are:
 
-``` text
+```text
 malformed JSON
 → DLQ
 
@@ -1503,7 +1503,7 @@ partition, offset, payload, failure reason, and failure timestamp.
 The original Kafka offset is committed only after the message reaches a terminal
 outcome:
 
-``` text
+```text
 successful processing
 → commit original Kafka offset
 
@@ -1563,7 +1563,7 @@ allowing the consumer to make progress.
 
 The important terminal failure windows are:
 
-``` text
+```text
 DLQ publication fails
 → no original offset commit
 → Kafka may redeliver
@@ -1631,7 +1631,7 @@ maximum of three processing attempts using exponential backoff between attempts.
 
 For the current policy:
 
-``` text
+```text
 attempt 1 fails
 → wait 1 second
 
@@ -1648,7 +1648,7 @@ will be made.
 
 The resulting failure paths are:
 
-``` text
+```text
 malformed JSON
 → DLQ
 
@@ -1669,7 +1669,7 @@ partition, offset, payload, failure reason, and failure timestamp.
 The original Kafka offset is committed only after the message reaches a terminal
 outcome:
 
-``` text
+```text
 successful processing
 → commit original Kafka offset
 
@@ -1728,7 +1728,7 @@ the consumer to make progress.
 
 The important terminal failure windows are:
 
-``` text
+```text
 DLQ publication fails
 → no original offset commit
 → Kafka may redeliver
@@ -1755,6 +1755,102 @@ Unit tests verify that:
 
 **Related decisions:** ADR-020, ADR-021, ADR-022, ADR-024
 
+
+## ADR-027 --- Introduce AWS deployment incrementally through local emulation
+
+**Status:** Accepted for MVP\
+**Stage:** Deployment and infrastructure
+
+### Context
+
+The platform already runs end to end through Docker Compose, with PostgreSQL,
+Kafka, Order Service, Routing Service, and Prediction Service running as local
+containers.
+
+The next infrastructure goal is to introduce AWS deployment concepts without
+moving the complete platform to AWS at once.
+
+Deploying every service and infrastructure dependency simultaneously would make
+it harder to distinguish application, containerization, networking, registry,
+and orchestration problems.
+
+It would also introduce unnecessary cloud cost and operational complexity while
+the deployment architecture is still being developed.
+
+### Decision
+
+Introduce AWS deployment incrementally using MiniStack as a local AWS emulator.
+
+The first deployment checkpoint covers Order Service only.
+
+Its container image is pushed to the locally emulated ECR registry and executed
+through ECS using a Fargate-compatible task definition.
+
+During this checkpoint:
+
+```text
+Order Service        → ECS / Fargate-compatible task
+Container image      → local ECR
+ECS control plane    → MiniStack
+
+PostgreSQL           → Docker Compose
+Kafka                → Docker Compose
+Routing Service      → Docker Compose
+Prediction Service   → Docker Compose
+```
+
+This deliberately creates a temporary hybrid environment.
+
+The deployment is considered validated only when the ECS-managed Order Service
+participates successfully in the existing end-to-end event flow through the
+final `ETAPredicted` event.
+
+### Trade-off
+
+The local environment does not reproduce AWS infrastructure exactly.
+
+MiniStack provides an AWS-compatible development surface while the actual
+containers still run on the local Docker environment. A successful local
+deployment therefore validates the deployment model and application integration,
+but does not prove that the same configuration is production-ready for AWS.
+
+The hybrid setup also temporarily mixes Docker Compose-managed workloads with
+an ECS-managed workload.
+
+These limitations are accepted because they allow deployment concepts and
+failure modes to be introduced independently rather than changing the complete
+runtime environment at once.
+
+### Alternatives considered
+
+- Deploy the complete platform to AWS immediately.
+- Move all three application services to ECS in a single change.
+- Continue using only Docker Compose until the entire AWS deployment is ready.
+- Introduce infrastructure-as-code before understanding the required AWS resources through direct AWS CLI operations.
+
+### Consequences
+
+The project now exercises the deployment path:
+
+```text
+Docker image
+→ ECR
+→ ECS task definition
+→ ECS task
+→ running container
+```
+
+Order Service has been executed successfully through this path and validated
+against the existing PostgreSQL and Kafka infrastructure.
+
+The next deployment step is to introduce an ECS Service for the long-running
+Order Service workload before extending ECS deployment to Routing Service and
+Prediction Service.
+
+Infrastructure-as-code can be introduced later once the required resources and
+their relationships are sufficiently understood.
+
+------------------------------------------------------------------------
 
 # Known Technical Debt
 

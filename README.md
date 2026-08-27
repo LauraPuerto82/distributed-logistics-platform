@@ -92,7 +92,10 @@ POST /shipments
 | Database | PostgreSQL 17 |
 | Database driver | pgx |
 | Event streaming | Apache Kafka |
-| Infrastructure | Docker Compose |
+| Containerization | Docker |
+| Local orchestration | Docker Compose |
+| Local AWS emulation | MiniStack |
+| Deployment | AWS CLI, ECR, ECS, Fargate-compatible task definitions |
 | Testing | Go testing / httptest / pytest |
 
 ## 🔌 API
@@ -293,6 +296,15 @@ PostgreSQL-specific behavior is covered separately by integration tests, includi
 | Prediction transactional outbox | Implemented |
 | `ETAPredicted` publication | Implemented |
 | Prediction PostgreSQL integration tests | Implemented |
+| Docker images for all three services | Implemented |
+| Full-platform Docker Compose execution | Implemented |
+| Persistent local MiniStack environment | Implemented |
+| Local ECR push/pull workflow | Implemented |
+| Order Service ECS task definition | Implemented (MiniStack) |
+| Order Service ECS/Fargate task execution | Implemented and E2E validated (MiniStack) |
+| Routing Service ECS deployment | Planned |
+| Prediction Service ECS deployment | Planned |
+| ECS Service-based deployment | Planned |
 
 ## 🗺️ Roadmap
 
@@ -324,8 +336,16 @@ Other processing failures are treated as transient. Both services perform a maxi
 
 The original Kafka offset is committed only after processing reaches a terminal outcome: either successful processing or successful dead-letter publication. If DLQ publication fails, the original offset remains uncommitted so Kafka can redeliver the message. If DLQ publication succeeds but the later offset commit fails, redelivery may produce a duplicate dead-letter record, which is intentionally accepted as at-least-once DLQ delivery.
 
+### Deployment
+
+The platform is fully containerized and runs end to end with Docker Compose. AWS deployment is being introduced incrementally using MiniStack as a local emulator.
+
+The first deployment checkpoint is complete for the Order Service: its image is stored in local ECR and has been executed through ECS using a Fargate-compatible task definition, while PostgreSQL, Kafka, Routing Service, and Prediction Service remain in Docker Compose. This hybrid setup has been validated end to end through the final `ETAPredicted` event.
+
+The next step is to introduce ECS Services for long-running workloads before extending the ECS deployment to Routing and Prediction.
+
 ## Architecture Decisions
 
 Architecture decisions, trade-offs, known technical debt, and intentionally deferred improvements are documented separately in [`docs/ARCHITECTURE_DECISIONS.md`](docs/ARCHITECTURE_DECISIONS.md).
 
-This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in both consumers, Routing permanent/transient failure classification, bounded retries with exponential backoff, dead-letter handling, and the remaining work to extend the same consumer failure policy to Prediction Service.
+This includes reliability trade-offs around PostgreSQL/Kafka coordination, persistent consumer idempotency, transactional outbox delivery in both Routing and Prediction, intentionally accepted at-least-once delivery semantics, explicit Kafka offset-commit behavior in both consumers, permanent/transient failure classification, bounded retries with exponential backoff, and dead-letter handling.
