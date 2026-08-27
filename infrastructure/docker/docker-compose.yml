@@ -37,6 +37,7 @@ services:
 
       KAFKA_LOG_DIRS: /var/lib/kafka/data
   order-service:
+    image: logistics-order-service:latest
     build:
       context: ../../services/order-service
     container_name: logistics-order-service
@@ -50,6 +51,7 @@ services:
       - postgres
       - kafka
   routing-service:
+    image: logistics-routing-service:latest
     build:
       context: ../../services/routing-service
     container_name: logistics-routing-service
@@ -61,6 +63,7 @@ services:
       - postgres
       - kafka
   prediction-service:
+    image: logistics-prediction-service:latest
     build:
       context: ../../services/prediction-service
     container_name: logistics-prediction-service
