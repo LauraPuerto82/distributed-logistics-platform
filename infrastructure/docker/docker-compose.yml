@@ -72,7 +72,21 @@ services:
     depends_on:
       - postgres
       - kafka
+  ministack:
+    image: ministackorg/ministack:1.5.0
+    container_name: logistics-ministack
+    ports:
+      - "4566:4566"
+    environment:
+      PERSIST_STATE: "1"
+      STATE_DIR: /tmp/ministack-state
+      DOCKER_NETWORK: docker_default
+      LOG_LEVEL: INFO
+    volumes:
+      - ministack_state:/tmp/ministack-state
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   postgres_data:
   kafka_data:
+  ministack_state:
