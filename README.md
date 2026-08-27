@@ -301,10 +301,10 @@ PostgreSQL-specific behavior is covered separately by integration tests, includi
 | Persistent local MiniStack environment | Implemented |
 | Local ECR push/pull workflow | Implemented |
 | Order Service ECS task definition | Implemented (MiniStack) |
-| Order Service ECS/Fargate task execution | Implemented and E2E validated (MiniStack) |
-| Routing Service ECS deployment | Planned |
-| Prediction Service ECS deployment | Planned |
-| ECS Service-based deployment | Planned |
+| Routing Service ECS task definition | Implemented (MiniStack) |
+| Prediction Service ECS task definition | Implemented (MiniStack) |
+| All application services ECS/Fargate task execution | Implemented and E2E validated (MiniStack) |
+| ECS Service-based deployment | Partially validated (MiniStack limitation identified) |
 
 ## 🗺️ Roadmap
 
@@ -340,9 +340,11 @@ The original Kafka offset is committed only after processing reaches a terminal 
 
 The platform is fully containerized and runs end to end with Docker Compose. AWS deployment is being introduced incrementally using MiniStack as a local emulator.
 
-The first deployment checkpoint is complete for the Order Service: its image is stored in local ECR and has been executed through ECS using a Fargate-compatible task definition, while PostgreSQL, Kafka, Routing Service, and Prediction Service remain in Docker Compose. This hybrid setup has been validated end to end through the final `ETAPredicted` event.
+The local ECS deployment has now been extended to all three application services. Order Service, Routing Service, and Prediction Service each have a Fargate-compatible task definition and their images are stored in local ECR. PostgreSQL and Kafka remain managed by Docker Compose as shared infrastructure.
 
-The next step is to introduce ECS Services for long-running workloads before extending the ECS deployment to Routing and Prediction.
+The complete event flow has been validated end to end with all three application services running as ECS-managed tasks: a shipment created through Order Service was processed by Routing Service and Prediction Service through Kafka, producing published `RouteCalculated` and `ETAPredicted` outbox events.
+
+ECS Service-based execution was also explored for the long-running Order Service workload. MiniStack successfully created and initially ran the service task, but did not reproduce ECS task replacement after the task was manually stopped. This is treated as a local-emulation limitation rather than validated ECS reconciliation behavior.
 
 ## Architecture Decisions
 

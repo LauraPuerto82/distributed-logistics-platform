@@ -1781,29 +1781,45 @@ the deployment architecture is still being developed.
 
 Introduce AWS deployment incrementally using MiniStack as a local AWS emulator.
 
-The first deployment checkpoint covers Order Service only.
+The deployment was introduced in stages rather than moving all application
+services to ECS at once.
 
-Its container image is pushed to the locally emulated ECR registry and executed
-through ECS using a Fargate-compatible task definition.
+The first checkpoint moved Order Service to an ECS-managed,
+Fargate-compatible task while PostgreSQL, Kafka, Routing Service, and Prediction
+Service remained managed by Docker Compose.
 
-During this checkpoint:
+After validating that hybrid deployment end to end, Routing Service and
+Prediction Service were moved to ECS-managed tasks as separate checkpoints.
+
+The current local deployment is:
 
 ```text
 Order Service        → ECS / Fargate-compatible task
-Container image      → local ECR
+Routing Service      → ECS / Fargate-compatible task
+Prediction Service   → ECS / Fargate-compatible task
+
+Container images     → local ECR
 ECS control plane    → MiniStack
 
 PostgreSQL           → Docker Compose
 Kafka                → Docker Compose
-Routing Service      → Docker Compose
-Prediction Service   → Docker Compose
 ```
 
-This deliberately creates a temporary hybrid environment.
+Each application service has its own Fargate-compatible task definition and its
+container image is stored in the locally emulated ECR registry.
 
-The deployment is considered validated only when the ECS-managed Order Service
-participates successfully in the existing end-to-end event flow through the
-final `ETAPredicted` event.
+The deployment is considered end-to-end validated because a shipment created
+through the ECS-managed Order Service was consumed by the ECS-managed Routing
+Service and Prediction Service through Kafka, producing published
+`RouteCalculated` and `ETAPredicted` outbox events.
+
+ECS Service-based execution was also explored for the long-running Order Service
+workload. MiniStack successfully created the ECS Service and initially ran its
+task, but did not reproduce ECS task replacement after that task was manually
+stopped.
+
+This behavior is treated as a limitation of the local emulator rather than as
+validated ECS reconciliation behavior.
 
 ### Trade-off
 
@@ -1814,8 +1830,14 @@ containers still run on the local Docker environment. A successful local
 deployment therefore validates the deployment model and application integration,
 but does not prove that the same configuration is production-ready for AWS.
 
-The hybrid setup also temporarily mixes Docker Compose-managed workloads with
-an ECS-managed workload.
+PostgreSQL and Kafka also remain Docker Compose-managed infrastructure rather
+than ECS-managed workloads. This keeps the current deployment focused on
+learning and validating the application-service deployment path without
+introducing every infrastructure concern simultaneously.
+
+ECS Service creation can be exercised locally, but the observed lack of task
+replacement means MiniStack cannot currently be used to validate the full ECS
+Service reconciliation lifecycle.
 
 These limitations are accepted because they allow deployment concepts and
 failure modes to be introduced independently rather than changing the complete
@@ -1826,11 +1848,14 @@ runtime environment at once.
 - Deploy the complete platform to AWS immediately.
 - Move all three application services to ECS in a single change.
 - Continue using only Docker Compose until the entire AWS deployment is ready.
+- Treat successful ECS Service creation in MiniStack as proof of ECS task
+  replacement behavior despite the emulator not reproducing it.
 - Introduce infrastructure-as-code before understanding the required AWS resources through direct AWS CLI operations.
 
 ### Consequences
 
-The project now exercises the deployment path:
+The project now exercises the deployment path for all three application
+services:
 
 ```text
 Docker image
@@ -1840,12 +1865,23 @@ Docker image
 → running container
 ```
 
-Order Service has been executed successfully through this path and validated
-against the existing PostgreSQL and Kafka infrastructure.
+Order Service, Routing Service, and Prediction Service have all been executed
+successfully through this path.
 
-The next deployment step is to introduce an ECS Service for the long-running
-Order Service workload before extending ECS deployment to Routing Service and
-Prediction Service.
+The complete event-driven flow has also been validated with all three
+application services running as ECS-managed tasks while PostgreSQL and Kafka
+remain in Docker Compose.
+
+This validates the application integration across the local ECS deployment
+boundary without claiming production-equivalent AWS behavior.
+
+ECS Service-based deployment remains only partially validated locally: service
+creation and initial task execution were observed, but automatic task
+replacement was not reproduced by MiniStack.
+
+A future deployment against real AWS should validate ECS Service reconciliation,
+networking, IAM, health checks, service discovery, and other production
+infrastructure behavior that local emulation does not prove.
 
 Infrastructure-as-code can be introduced later once the required resources and
 their relationships are sufficiently understood.
