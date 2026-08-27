@@ -1799,19 +1799,51 @@ Routing Service      → ECS / Fargate-compatible task
 Prediction Service   → ECS / Fargate-compatible task
 
 Container images     → local ECR
+Secrets              → MiniStack Secrets Manager
 ECS control plane    → MiniStack
 
 PostgreSQL           → Docker Compose
 Kafka                → Docker Compose
 ```
 
-Each application service has its own Fargate-compatible task definition and its
-container image is stored in the locally emulated ECR registry.
+Each application service has its own Fargate-compatible task-definition template
+and its container image is stored in the locally emulated ECR registry.
 
-The deployment is considered end-to-end validated because a shipment created
-through the ECS-managed Order Service was consumed by the ECS-managed Routing
-Service and Prediction Service through Kafka, producing published
-`RouteCalculated` and `ETAPredicted` outbox events.
+Application database connection strings are stored in MiniStack Secrets Manager
+rather than embedded directly in the version-controlled task definitions. The
+secret ARNs are resolved at deployment time and injected into generated task
+definitions derived from the committed templates.
+
+This avoids coupling version-controlled infrastructure files to identifiers
+created by a particular local environment while exercising the same conceptual
+secret-injection boundary that would be used in AWS.
+
+Local deployment is automated through `scripts/deploy-local.ps1`. The script
+starts the shared infrastructure, creates or reuses the required local AWS
+resources, creates or updates the application secrets, builds and pushes the
+service images, generates task definitions from the templates, registers them,
+and starts all three application tasks.
+
+Deployment readiness is checked according to the observable behavior available
+for each service. Order Service exposes an HTTP health endpoint, so the deployment
+waits for that endpoint to become healthy. Routing Service and Prediction Service
+are asynchronous consumers without exposed HTTP ports, so the deployment waits
+for their Kafka consumer groups to reach `Stable` state with active members before
+reporting the platform as ready.
+
+This deployment-level readiness check does not change the individual service
+readiness semantics. In particular, Order Service can still start successfully
+while Kafka is unavailable, as documented separately in TD-004.
+
+The complete event-driven workflow is validated reproducibly through
+`scripts/test-e2e.ps1`. The script creates a shipment through Order Service and
+polls the Routing and Prediction transactional outboxes until published
+`RouteCalculated` and `ETAPredicted` events are observed.
+
+The environment can be stopped through `scripts/stop-local.ps1`, which stops
+running ECS application tasks when MiniStack is available and then stops the
+Docker Compose infrastructure. The teardown remains safe when MiniStack is
+already stopped.
 
 ECS Service-based execution was also explored for the long-running Order Service
 workload. MiniStack successfully created the ECS Service and initially ran its
@@ -1835,6 +1867,17 @@ than ECS-managed workloads. This keeps the current deployment focused on
 learning and validating the application-service deployment path without
 introducing every infrastructure concern simultaneously.
 
+The deployment automation uses direct AWS CLI and PowerShell operations rather
+than infrastructure-as-code. This keeps the current infrastructure mechanics
+explicit while the required resources and relationships are still being learned,
+but it means the deployment definition is not yet expressed through a declarative
+IaC tool.
+
+The Kafka consumer-group readiness check depends on the output and behavior of
+the Kafka CLI provided by the current image. This is sufficient for the local
+portfolio environment but may require adjustment if the Kafka image or CLI output
+changes.
+
 ECS Service creation can be exercised locally, but the observed lack of task
 replacement means MiniStack cannot currently be used to validate the full ECS
 Service reconciliation lifecycle.
@@ -1848,40 +1891,52 @@ runtime environment at once.
 - Deploy the complete platform to AWS immediately.
 - Move all three application services to ECS in a single change.
 - Continue using only Docker Compose until the entire AWS deployment is ready.
+- Store database connection strings directly in ECS task-definition environment
+  variables instead of using Secrets Manager.
+- Commit environment-specific secret ARNs directly in the task definitions rather
+  than resolving them during deployment.
+- Consider ECS task startup alone sufficient evidence that asynchronous consumers
+  are ready.
 - Treat successful ECS Service creation in MiniStack as proof of ECS task
   replacement behavior despite the emulator not reproducing it.
-- Introduce infrastructure-as-code before understanding the required AWS resources through direct AWS CLI operations.
+- Introduce infrastructure-as-code before understanding the required AWS resources
+  through direct AWS CLI operations.
 
 ### Consequences
 
-The project now exercises the deployment path for all three application
+The project now exercises an automated deployment path for all three application
 services:
 
 ```text
 Docker image
-→ ECR
-→ ECS task definition
-→ ECS task
-→ running container
+→ local ECR
+→ resolve Secrets Manager references
+→ generate ECS task definition from template
+→ register ECS task definition
+→ start ECS task
+→ verify service-specific readiness
 ```
 
 Order Service, Routing Service, and Prediction Service have all been executed
 successfully through this path.
 
-The complete event-driven flow has also been validated with all three
-application services running as ECS-managed tasks while PostgreSQL and Kafka
-remain in Docker Compose.
+The complete event-driven flow has also been validated through one reproducible
+E2E command after deployment rather than relying on a sequence of manual terminal
+commands.
 
 This validates the application integration across the local ECS deployment
 boundary without claiming production-equivalent AWS behavior.
+
+The deployment scripts also make local setup and teardown repeatable while
+keeping generated environment-specific secret identifiers out of version control.
 
 ECS Service-based deployment remains only partially validated locally: service
 creation and initial task execution were observed, but automatic task
 replacement was not reproduced by MiniStack.
 
 A future deployment against real AWS should validate ECS Service reconciliation,
-networking, IAM, health checks, service discovery, and other production
-infrastructure behavior that local emulation does not prove.
+networking, IAM, health checks, service discovery, Secrets Manager permissions,
+and other production infrastructure behavior that local emulation does not prove.
 
 Infrastructure-as-code can be introduced later once the required resources and
 their relationships are sufficiently understood.

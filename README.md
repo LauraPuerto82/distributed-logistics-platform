@@ -95,7 +95,7 @@ POST /shipments
 | Containerization | Docker |
 | Local orchestration | Docker Compose |
 | Local AWS emulation | MiniStack |
-| Deployment | AWS CLI, ECR, ECS, Fargate-compatible task definitions |
+| Deployment | AWS CLI, ECR, ECS, Secrets Manager, Fargate-compatible task definitions |
 | Testing | Go testing / httptest / pytest |
 
 ## 🔌 API
@@ -123,29 +123,93 @@ A successful creation persists the shipment and publishes a `ShipmentCreated` ev
 
 ### Prerequisites
 
-- Go
-- Python 3.12+
-- uv
 - Docker
 - Docker Compose
+- AWS CLI
+- PowerShell
 
-### 1. Start infrastructure
+> Go, Python 3.12+, and uv are only required when running or testing services directly outside Docker.
+
+### Quick Start
+
+The complete platform can be deployed locally with a single command from the repository root:
+
+```powershell
+.\scripts\deploy-local.ps1
+```
+
+The deployment script:
+
+- starts PostgreSQL, Kafka, and MiniStack;
+- creates or reuses the local ECS cluster and ECR repositories;
+- creates or updates application database connection strings in Secrets Manager;
+- builds the three application images;
+- pushes them to the MiniStack ECR endpoint;
+- generates ECS task definitions from templates with the resolved secret ARNs;
+- starts Order Service, Routing Service, and Prediction Service as ECS/Fargate-compatible tasks;
+- waits for the Order Service health check;
+- waits until the Routing and Prediction Kafka consumer groups are stable with active members.
+
+When the platform is ready, the script finishes with:
+
+```text
+Local deployment is ready.
+```
+
+The Order Service API is available at `http://localhost:8080`.
+
+Current local infrastructure ports:
+
+```text
+PostgreSQL  localhost:5434
+Kafka       localhost:9092
+MiniStack   localhost:4566
+```
+
+### End-to-End Validation
+
+After deployment, validate the complete asynchronous workflow with:
+
+```powershell
+.\scripts\test-e2e.ps1
+```
+
+The script creates a shipment through Order Service and verifies the event-driven flow:
+
+```text
+ShipmentCreated
+→ RouteCalculated
+→ ETAPredicted
+```
+
+It polls the Routing and Prediction transactional outboxes until the expected published events are observed or the validation times out.
+
+A successful run ends with:
+
+```text
+End-to-end validation passed.
+```
+
+### Stop the Environment
+
+```powershell
+.\scripts\stop-local.ps1
+```
+
+The script stops the ECS application tasks and then stops PostgreSQL, Kafka, and MiniStack. It can also be safely executed when MiniStack is already stopped.
+
+### Running Services Directly
+
+The automated MiniStack deployment above is the recommended way to run the complete platform. For service-level development and debugging, the services can still be run directly against the Docker Compose infrastructure.
+
+Start the shared infrastructure:
 
 ```bash
 cd infrastructure/docker
 docker compose up -d
 ```
 
-Current local ports:
-
-```text
-PostgreSQL  localhost:5434
-Kafka       localhost:9092
-```
-
-### 2. Configure Order Service
-
-PowerShell:
+Order Service environment:
 
 ```powershell
 $env:DATABASE_URL="postgres://logistics:logistics@localhost:5434/logistics"
@@ -153,22 +217,14 @@ $env:KAFKA_BROKER="localhost:9092"
 $env:KAFKA_TOPIC="shipment-events"
 ```
 
-### 3. Run Order Service
+Run Order Service:
 
 ```bash
 cd services/order-service
 go run .
 ```
 
-The API runs on `http://localhost:8080`.
-
-> The PostgreSQL schema is currently created manually. Database migrations are planned.
-
-### 4. Configure Routing Service
-
-The Routing Service uses PostgreSQL to persist processed event IDs and transactional outbox events, and Kafka to consume and publish domain events.
-
-PowerShell:
+Routing Service environment:
 
 ```powershell
 $env:DATABASE_URL="postgres://logistics:logistics@localhost:5434/logistics"
@@ -176,32 +232,22 @@ $env:KAFKA_BROKER="localhost:9092"
 $env:KAFKA_TOPIC="shipment-events"
 ```
 
-### 5. Run Routing Service
-
-Open a separate terminal:
+Run Routing Service in a separate terminal:
 
 ```bash
 cd services/routing-service
 go run .
 ```
 
-The service consumes `ShipmentCreated` events idempotently, calculates the shortest route using Dijkstra's algorithm, and stores the resulting `RouteCalculated` event in a transactional outbox. A background outbox publisher then publishes pending events to Kafka and marks them as published after successful delivery.
-
-### 6. Configure Prediction Service
-
-The Prediction Service uses PostgreSQL to persist processed event IDs and transactional outbox events, and Kafka to consume and publish domain events.
-
-PowerShell:
+Prediction Service environment:
 
 ```powershell
-$env:DATABASE_URL="postgres://logistics:logistics@localhost:5434/logistics"
+$env:DATABASE_URL="postgresql://logistics:logistics@localhost:5434/logistics"
 $env:KAFKA_BROKER="localhost:9092"
 $env:KAFKA_TOPIC="shipment-events"
 ```
 
-### 7. Run Prediction Service
-
-Open another terminal:
+Run Prediction Service in another terminal:
 
 ```bash
 cd services/prediction-service
@@ -209,7 +255,7 @@ uv sync
 uv run prediction-service
 ```
 
-The service validates incoming `RouteCalculated` events with Pydantic, processes them idempotently, estimates travel time using the current MVP baseline, and atomically persists the processed input event together with the resulting `ETAPredicted` outbox event. A background outbox publisher then publishes pending events to Kafka and marks them as published after successful delivery.
+> The PostgreSQL schema is currently created manually. Database migrations are planned.
 
 ## 🧪 Testing
 
@@ -300,9 +346,11 @@ PostgreSQL-specific behavior is covered separately by integration tests, includi
 | Full-platform Docker Compose execution | Implemented |
 | Persistent local MiniStack environment | Implemented |
 | Local ECR push/pull workflow | Implemented |
-| Order Service ECS task definition | Implemented (MiniStack) |
-| Routing Service ECS task definition | Implemented (MiniStack) |
-| Prediction Service ECS task definition | Implemented (MiniStack) |
+| ECS/Fargate task-definition templates | Implemented for all services |
+| Secrets Manager integration | Implemented (MiniStack) |
+| Automated local MiniStack deployment | Implemented |
+| Kafka consumer-group readiness checks | Implemented |
+| Automated end-to-end validation | Implemented |
 | All application services ECS/Fargate task execution | Implemented and E2E validated (MiniStack) |
 | ECS Service-based deployment | Partially validated (MiniStack limitation identified) |
 
@@ -338,11 +386,13 @@ The original Kafka offset is committed only after processing reaches a terminal 
 
 ### Deployment
 
-The platform is fully containerized and runs end to end with Docker Compose. AWS deployment is being introduced incrementally using MiniStack as a local emulator.
+The platform is fully containerized and runs end to end locally. AWS deployment concepts are exercised through MiniStack rather than a real AWS deployment.
 
-The local ECS deployment has now been extended to all three application services. Order Service, Routing Service, and Prediction Service each have a Fargate-compatible task definition and their images are stored in local ECR. PostgreSQL and Kafka remain managed by Docker Compose as shared infrastructure.
+Local deployment is automated through PowerShell scripts. PostgreSQL, Kafka, and MiniStack run through Docker Compose, while the three application images are built and pushed to MiniStack's local ECR endpoint. Database connection strings are stored in MiniStack Secrets Manager and injected into ECS task definitions generated from version-controlled templates at deployment time.
 
-The complete event flow has been validated end to end with all three application services running as ECS-managed tasks: a shipment created through Order Service was processed by Routing Service and Prediction Service through Kafka, producing published `RouteCalculated` and `ETAPredicted` outbox events.
+Order Service, Routing Service, and Prediction Service run as ECS/Fargate-compatible tasks. Deployment readiness is not based only on task startup: the deployment waits for the Order Service health endpoint and for the Routing and Prediction Kafka consumer groups to reach a stable state with active members before reporting the platform as ready.
+
+The complete asynchronous workflow is reproducibly validated through `scripts/test-e2e.ps1`. The script creates a shipment through Order Service and polls the transactional outboxes until published `RouteCalculated` and `ETAPredicted` events are observed.
 
 ECS Service-based execution was also explored for the long-running Order Service workload. MiniStack successfully created and initially ran the service task, but did not reproduce ECS task replacement after the task was manually stopped. This is treated as a local-emulation limitation rather than validated ECS reconciliation behavior.
 
