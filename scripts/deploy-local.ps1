@@ -67,6 +67,88 @@ try {
         -f $DockerComposeFile `
         up -d postgres kafka ministack
 
+    Write-Host "Waiting for PostgreSQL to become ready..."
+
+    $PostgresMaxAttempts = 15
+    $PostgresRetryDelaySeconds = 2
+    $PostgresReady = $false
+
+    for ($attempt = 1; $attempt -le $PostgresMaxAttempts; $attempt++) {
+        try {
+            docker compose `
+                -f $DockerComposeFile `
+                exec -T postgres `
+                pg_isready `
+                -U logistics `
+                -d logistics | Out-Null
+
+            if ($LASTEXITCODE -eq 0) {
+                $PostgresReady = $true
+                break
+            }
+        }
+        catch {
+            # pg_isready returns a non-zero exit code while PostgreSQL is still starting.
+            # That is expected during the readiness polling loop.
+        }
+
+        Write-Host "PostgreSQL not ready yet ($attempt/$PostgresMaxAttempts)..."
+        Start-Sleep -Seconds $PostgresRetryDelaySeconds
+    }
+
+    if (-not $PostgresReady) {
+        throw "PostgreSQL did not become ready within the expected time."
+    }
+
+    Write-Host "PostgreSQL is ready."
+
+    Write-Host "Applying database migrations..."
+
+    $MigrationsDirectory = Join-Path `
+        $RepoRoot `
+        "infrastructure/postgres/migrations"
+
+    docker run --rm `
+        --network distributed-logistics-network `
+        -v "${MigrationsDirectory}:/db/migrations" `
+        -e DATABASE_URL="postgres://logistics:logistics@postgres:5432/logistics?sslmode=disable" `
+        ghcr.io/amacneil/dbmate:2.35.1 `
+        --migrations-dir /db/migrations `
+        up
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Database migrations failed."
+    }
+
+    Write-Host "Database migrations applied."
+
+    $KafkaContainer = "distributed-logistics-kafka"
+
+    $KafkaTopics = @(
+        "shipment-events",
+        "routing-service-dlq",
+        "prediction-service-dlq"
+    )
+
+    Write-Host "Ensuring Kafka topics exist..."
+
+    foreach ($topic in $KafkaTopics) {
+        docker exec $KafkaContainer `
+            /opt/kafka/bin/kafka-topics.sh `
+            --bootstrap-server localhost:9092 `
+            --create `
+            --if-not-exists `
+            --topic $topic `
+            --partitions 1 `
+            --replication-factor 1
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to ensure Kafka topic '$topic' exists."
+        }
+    }
+
+    Write-Host "Kafka topics are ready."
+
     Write-Host "Waiting for MiniStack to become ready..."
 
     $MiniStackMaxAttempts = 15
@@ -120,9 +202,9 @@ try {
     }
 
     $EcrRepositories = @(
-        "logistics-order-service",
-        "logistics-routing-service",
-        "logistics-prediction-service"
+        "distributed-logistics-order-service",
+        "distributed-logistics-routing-service",
+        "distributed-logistics-prediction-service"
     )
 
     Write-Host "Checking ECR repositories..."
@@ -134,7 +216,8 @@ try {
             aws ecr describe-repositories `
                 --repository-names $repository `
                 --endpoint-url $MiniStackEndpoint `
-                --output json | Out-Null
+                --output json `
+                2>$null | Out-Null
         }
         catch {
             $repositoryExists = $false
@@ -172,7 +255,8 @@ try {
             $secretResponse = aws secretsmanager describe-secret `
                 --secret-id $secret.Name `
                 --endpoint-url $MiniStackEndpoint `
-                --output json | ConvertFrom-Json
+                --output json `
+                2>$null | ConvertFrom-Json
         }
         catch {
             $secretExists = $false
@@ -211,7 +295,7 @@ try {
     Write-Host "Tagging and pushing images to local ECR..."
 
     foreach ($service in $Services) {
-        $imageName = "logistics-$service"
+        $imageName = "distributed-logistics-$service"
         $localEcrImage = "$MiniStackRegistry/${imageName}:latest"
 
         Write-Host "Processing '$imageName'..."
@@ -389,7 +473,7 @@ try {
 
         for ($attempt = 1; $attempt -le $KafkaConsumerMaxAttempts; $attempt++) {
             try {
-                $groupState = docker exec logistics-kafka `
+                $groupState = docker exec distributed-logistics-kafka `
                     /opt/kafka/bin/kafka-consumer-groups.sh `
                     --bootstrap-server localhost:9092 `
                     --describe `
@@ -404,8 +488,23 @@ try {
                     }
 
                 if ($stableGroup) {
-                    $consumerReady = $true
-                    break
+                    $groupMembers = docker exec distributed-logistics-kafka `
+                        /opt/kafka/bin/kafka-consumer-groups.sh `
+                        --bootstrap-server localhost:9092 `
+                        --describe `
+                        --group $group `
+                        --members 2>&1
+
+                    $memberWithAssignedPartitions = $groupMembers |
+                        Where-Object {
+                            $_ -match "^$group\s+" -and
+                            $_ -match "\s[1-9]\d*\s*$"
+                        }
+
+                    if ($memberWithAssignedPartitions) {
+                        $consumerReady = $true
+                        break
+                    }
                 }
             }
             catch {
@@ -419,7 +518,7 @@ try {
         }
 
         if (-not $consumerReady) {
-            throw "Kafka consumer group '$group' did not become stable within the expected time."
+            throw "Kafka consumer group '$group' did not become ready with assigned partitions within the expected time."
         }
 
         Write-Host "Kafka consumer group '$group' is ready."

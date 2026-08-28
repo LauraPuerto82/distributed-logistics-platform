@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:17
-    container_name: logistics-postgres
+    container_name: distributed-logistics-postgres
     environment:
       POSTGRES_DB: logistics
       POSTGRES_USER: logistics
@@ -12,7 +12,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
   kafka:
     image: apache/kafka:4.1.1
-    container_name: logistics-kafka
+    container_name: distributed-logistics-kafka
     ports:
       - "9092:9092"
     volumes:
@@ -37,10 +37,10 @@ services:
 
       KAFKA_LOG_DIRS: /var/lib/kafka/data
   order-service:
-    image: logistics-order-service:latest
+    image: distributed-logistics-order-service:latest
     build:
       context: ../../services/order-service
-    container_name: logistics-order-service
+    container_name: distributed-logistics-order-service
     environment:
       DATABASE_URL: postgres://logistics:logistics@postgres:5432/logistics
       KAFKA_BROKER: kafka:29092
@@ -51,10 +51,10 @@ services:
       - postgres
       - kafka
   routing-service:
-    image: logistics-routing-service:latest
+    image: distributed-logistics-routing-service:latest
     build:
       context: ../../services/routing-service
-    container_name: logistics-routing-service
+    container_name: distributed-logistics-routing-service
     environment:
       DATABASE_URL: postgres://logistics:logistics@postgres:5432/logistics
       KAFKA_BROKER: kafka:29092
@@ -63,10 +63,10 @@ services:
       - postgres
       - kafka
   prediction-service:
-    image: logistics-prediction-service:latest
+    image: distributed-logistics-prediction-service:latest
     build:
       context: ../../services/prediction-service
-    container_name: logistics-prediction-service
+    container_name: distributed-logistics-prediction-service
     environment:
       DATABASE_URL: postgresql://logistics:logistics@postgres:5432/logistics
       KAFKA_BROKER: kafka:29092
@@ -77,13 +77,13 @@ services:
       - kafka
   ministack:
     image: ministackorg/ministack:1.5.0
-    container_name: logistics-ministack
+    container_name: distributed-logistics-ministack
     ports:
       - "4566:4566"
     environment:
       PERSIST_STATE: "1"
       STATE_DIR: /tmp/ministack-state
-      DOCKER_NETWORK: docker_default
+      DOCKER_NETWORK: distributed-logistics-network
       LOG_LEVEL: INFO
     volumes:
       - ministack_state:/tmp/ministack-state
@@ -91,5 +91,14 @@ services:
 
 volumes:
   postgres_data:
+    name: distributed-logistics-postgres-data
+
   kafka_data:
+    name: distributed-logistics-kafka-data
+
   ministack_state:
+    name: distributed-logistics-ministack-state
+
+networks:
+  default:
+    name: distributed-logistics-network

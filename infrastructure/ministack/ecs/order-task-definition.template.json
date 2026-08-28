@@ -7,7 +7,7 @@
     "containerDefinitions": [
       {
         "name": "order-service",
-        "image": "localhost:4566/logistics-order-service:latest",
+        "image": "localhost:4566/distributed-logistics-order-service:latest",
         "essential": true,
         "portMappings": [
           {

@@ -19,10 +19,25 @@ $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
 $OrderServiceUrl = "http://localhost:8080"
-$PostgresContainer = "logistics-postgres"
+$PostgresContainer = "distributed-logistics-postgres"
 
 $MaxAttempts = 30
 $RetryDelaySeconds = 1
+
+Write-Host "Checking local deployment..."
+
+try {
+    Invoke-RestMethod `
+        -Uri "$OrderServiceUrl/health" `
+        -Method Get `
+        -TimeoutSec 5 |
+        Out-Null
+}
+catch {
+    throw "Local deployment is not available. Run .\scripts\deploy-local.ps1 before executing the end-to-end test."
+}
+
+Write-Host "Local deployment is available."
 
 Write-Host "Creating test shipment..."
 
