@@ -1819,17 +1819,19 @@ created by a particular local environment while exercising the same conceptual
 secret-injection boundary that would be used in AWS.
 
 Local deployment is automated through `scripts/deploy-local.ps1`. The script
-starts the shared infrastructure, creates or reuses the required local AWS
-resources, creates or updates the application secrets, builds and pushes the
-service images, generates task definitions from the templates, registers them,
-and starts all three application tasks.
+starts the shared infrastructure, waits for PostgreSQL readiness, applies
+versioned SQL migrations with dbmate, creates the required Kafka topics,
+creates or reuses the required local AWS resources, creates or updates the
+application secrets, builds and pushes the service images, generates task
+definitions from the templates, registers them, and starts all three
+application tasks.
 
 Deployment readiness is checked according to the observable behavior available
 for each service. Order Service exposes an HTTP health endpoint, so the deployment
 waits for that endpoint to become healthy. Routing Service and Prediction Service
 are asynchronous consumers without exposed HTTP ports, so the deployment waits
-for their Kafka consumer groups to reach `Stable` state with active members before
-reporting the platform as ready.
+for their Kafka consumer groups to reach `Stable` state with active members and
+assigned partitions before reporting the platform as ready.
 
 This deployment-level readiness check does not change the individual service
 readiness semantics. In particular, Order Service can still start successfully
@@ -1842,8 +1844,15 @@ polls the Routing and Prediction transactional outboxes until published
 
 The environment can be stopped through `scripts/stop-local.ps1`, which stops
 running ECS application tasks when MiniStack is available and then stops the
-Docker Compose infrastructure. The teardown remains safe when MiniStack is
-already stopped.
+Docker Compose infrastructure while preserving containers, volumes, and local
+state for a later restart. The teardown remains safe when MiniStack is already
+stopped.
+
+For a destructive project reset, `scripts/clean-local.ps1` stops project ECS
+tasks when possible and removes the project's Docker Compose containers,
+persistent volumes, explicitly named network, and application image tags.
+Cleanup is intentionally scoped to project-owned resources and does not use
+global Docker prune operations or remove shared base images.
 
 ECS Service-based execution was also explored for the long-running Order Service
 workload. MiniStack successfully created the ECS Service and initially ran its
@@ -1943,6 +1952,108 @@ their relationships are sufficiently understood.
 
 ------------------------------------------------------------------------
 
+## ADR-028 --- Manage PostgreSQL schema changes through versioned deployment migrations
+
+**Status:** Accepted\
+**Stage:** Local deployment reproducibility
+
+### Context
+
+The platform uses one PostgreSQL database across services implemented in Go and
+Python.
+
+The database schema was initially created manually. That was sufficient while
+the schema was small and development was local, but it made a fresh environment
+depend on undocumented database state and manual setup.
+
+Schema creation also needs to happen before application tasks start. Running
+migrations independently from service startup keeps schema lifecycle management
+explicit and avoids making every service responsible for coordinating database
+changes.
+
+### Decision
+
+Manage PostgreSQL schema changes through versioned SQL migrations using dbmate.
+
+Migration files are stored under:
+
+```text
+infrastructure/postgres/migrations
+```
+
+The local deployment runs dbmate 2.35.1 in Docker after PostgreSQL becomes ready
+and before application tasks are started.
+
+The current migrations create:
+
+```text
+shipments
+routing.processed_events
+routing.outbox_events
+prediction.processed_events
+prediction.outbox_events
+```
+
+dbmate records applied migrations in `schema_migrations`, so repeated deployments
+apply only migrations that have not already been executed.
+
+Application services do not run migrations during startup. Schema migration is
+an explicit deployment phase.
+
+The migration container joins the explicitly named
+`distributed-logistics-network` Docker network so it can reach PostgreSQL by its
+Compose service name.
+
+For local migration execution, the deployment script uses the development
+database credentials directly. Runtime application connection strings remain
+stored in MiniStack Secrets Manager and are injected into the ECS task
+definitions separately.
+
+### Trade-off
+
+The deployment now depends on an additional migration tool and on maintaining
+ordered SQL migration files as the schema evolves.
+
+Using plain SQL keeps migrations independent from the Go and Python application
+frameworks, but application model changes and database migrations must still be
+coordinated deliberately.
+
+Local deployment credentials are intentionally available to the deployment
+script. This is acceptable for the isolated local development environment but
+does not define how production migration credentials should be managed.
+
+### Alternatives considered
+
+-   Continue creating the database schema manually.
+-   Use PostgreSQL `docker-entrypoint-initdb.d` initialization scripts.
+-   Build a custom SQL migration runner.
+-   Use Alembic, coupling shared schema management to the Python service.
+-   Use separate migration tooling for Go and Python services.
+-   Run migrations automatically from application service startup.
+
+### Consequences
+
+A fresh local environment can reconstruct the required PostgreSQL schema from
+version-controlled migration history without manual SQL setup.
+
+Existing environments can be redeployed without reapplying migrations that have
+already been recorded.
+
+Database schema lifecycle is now part of the reproducible deployment path:
+
+```text
+start PostgreSQL
+→ wait for readiness
+→ apply pending migrations
+→ bootstrap Kafka topics
+→ start application tasks
+```
+
+Schema changes should be introduced through new migration files rather than by
+editing an already-applied migration.
+
+------------------------------------------------------------------------
+
 # Known Technical Debt
 
 ## TD-001 --- Non-atomic PostgreSQL + Kafka writes
@@ -2037,19 +2148,27 @@ failure semantics.
 
 ------------------------------------------------------------------------
 
-## TD-006 --- Database schema changes are manual
+## TD-006 --- Manual database schema management
 
-**Area:** Database\
+**Status:** Resolved\
+**Area:** Database schema management\
 **Priority:** Medium
 
-**Current limitation:**\
-The initial `shipments` table was created manually in PostgreSQL.
+**Original limitation:**\
+Database schema changes were created manually and the repository did not have a
+versioned migration mechanism. Reconstructing a fresh environment therefore
+depended on manual SQL setup rather than repository-controlled schema history.
 
-This is sufficient for the current development stage but does not
-provide a reproducible schema evolution process.
+**Resolution:**\
+PostgreSQL schema changes are now managed through versioned SQL migrations under
+`infrastructure/postgres/migrations`.
 
-**Planned evolution:**\
-Introduce versioned database migrations when the schema starts evolving.
+Local deployment runs dbmate explicitly after PostgreSQL becomes ready and
+before application tasks start. Applied migrations are tracked in
+`schema_migrations`, allowing fresh and existing local environments to converge
+through the same deployment path.
+
+**Related decision:** ADR-028
 
 ------------------------------------------------------------------------
 
