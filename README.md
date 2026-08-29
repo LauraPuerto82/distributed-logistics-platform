@@ -127,7 +127,7 @@ A successful creation persists the shipment and publishes a `ShipmentCreated` ev
 - Docker
 - Docker Compose
 - AWS CLI
-- PowerShell
+- PowerShell 7+ on Windows, or Bash 4+ and `curl` on Linux
 
 > Go, Python 3.12+, and uv are only required when running or testing services directly outside Docker.
 
@@ -135,8 +135,16 @@ A successful creation persists the shipment and publishes a `ShipmentCreated` ev
 
 The complete platform can be deployed locally with a single command from the repository root:
 
+Windows:
+
 ```powershell
-.\scripts\deploy-local.ps1
+.\scripts\windows\deploy-local.ps1
+```
+
+Linux:
+
+```bash
+./scripts/linux/deploy-local.sh
 ```
 
 The deployment script:
@@ -174,11 +182,19 @@ MiniStack   localhost:4566
 
 After deployment, validate the complete asynchronous workflow with:
 
+Windows:
+
 ```powershell
-.\scripts\test-e2e.ps1
+.\scripts\windows\test-e2e.ps1
 ```
 
-The validation expects the local deployment to be running. If the Order Service health endpoint is unavailable, the script exits with an explicit instruction to run `.\scripts\deploy-local.ps1` first.
+Linux:
+
+```bash
+./scripts/linux/test-e2e.sh
+```
+
+The validation expects the local deployment to be running. If the Order Service health endpoint is unavailable, the script exits with an explicit instruction to run the platform deployment script first.
 
 The script creates a shipment through Order Service and verifies the event-driven flow:
 
@@ -198,8 +214,16 @@ End-to-end validation passed.
 
 ### Stop the Environment
 
+Windows:
+
 ```powershell
-.\scripts\stop-local.ps1
+.\scripts\windows\stop-local.ps1
+```
+
+Linux:
+
+```bash
+./scripts/linux/stop-local.sh
 ```
 
 The script stops the ECS application tasks and then stops PostgreSQL, Kafka, and MiniStack. It can also be safely executed when MiniStack is already stopped.
@@ -208,11 +232,19 @@ The script stops the ECS application tasks and then stops PostgreSQL, Kafka, and
 
 To completely remove the local project environment:
 
+Windows:
+
 ```powershell
-.\scripts\clean-local.ps1
+.\scripts\windows\clean-local.ps1
 ```
 
-Unlike `stop-local.ps1`, which preserves local state for a later restart, the cleanup script removes the project's Docker Compose containers, persistent volumes, network, and application image tags.
+Linux:
+
+```bash
+./scripts/linux/clean-local.sh
+```
+
+Unlike the `stop-local` scripts, which preserve local state for a later restart, the cleanup scripts remove the project's Docker Compose containers, persistent volumes, network, and application image tags.
 
 Cleanup is intentionally scoped to resources explicitly owned by this project. Shared/base Docker images are preserved, and no global Docker prune commands are used.
 
@@ -372,6 +404,7 @@ PostgreSQL-specific behavior is covered separately by integration tests, includi
 | Kafka consumer-group readiness checks | Implemented (stable members with assigned partitions) |
 | Automated end-to-end validation | Implemented |
 | Project-scoped local environment cleanup | Implemented |
+| Cross-platform local deployment automation | Implemented and E2E validated (Windows PowerShell / Linux Bash) |
 | All application services ECS/Fargate task execution | Implemented and E2E validated (MiniStack) |
 | ECS Service-based deployment | Partially validated (MiniStack limitation identified) |
 
@@ -409,15 +442,15 @@ The original Kafka offset is committed only after processing reaches a terminal 
 
 The platform is fully containerized and runs end to end locally. AWS deployment concepts are exercised through MiniStack rather than a real AWS deployment.
 
-Local deployment is automated through PowerShell scripts. PostgreSQL, Kafka, and MiniStack run through Docker Compose on an explicitly named project network. Once PostgreSQL is ready, versioned SQL migrations are applied with dbmate and the required Kafka topics are created explicitly before application consumers start.
+Local deployment is automated through platform-specific PowerShell and Bash scripts under `scripts/windows/` and `scripts/linux/`. PostgreSQL, Kafka, and MiniStack run through Docker Compose on an explicitly named project network. Once PostgreSQL is ready, versioned SQL migrations are applied with dbmate and the required Kafka topics are created explicitly before application consumers start.
 
 The three application images are then built and pushed to MiniStack's local ECR endpoint. Database connection strings are stored in MiniStack Secrets Manager and injected into ECS task definitions generated from version-controlled templates at deployment time.
 
 Order Service, Routing Service, and Prediction Service run as ECS/Fargate-compatible tasks. Deployment readiness is not based only on task startup or Kafka group stability: the deployment waits for the Order Service health endpoint and verifies that the Routing and Prediction consumer groups are stable, have active members, and have partitions assigned before reporting the platform as ready.
 
-The complete asynchronous workflow is reproducibly validated through `scripts/test-e2e.ps1`. The script first verifies that the local deployment is available, then creates a shipment through Order Service and polls the transactional outboxes until published `RouteCalculated` and `ETAPredicted` events are observed.
+The complete asynchronous workflow is reproducibly validated through the platform-specific `test-e2e` scripts. Each script first verifies that the local deployment is available, then creates a shipment through Order Service and polls the transactional outboxes until published `RouteCalculated` and `ETAPredicted` events are observed.
 
-Local environment lifecycle is explicit: `stop-local.ps1` performs a non-destructive shutdown that preserves state, while `clean-local.ps1` removes only project-owned containers, volumes, network, and application image tags for a reproducible fresh start.
+Local environment lifecycle is explicit on both platforms: the `stop-local` scripts perform a non-destructive shutdown that preserves state, while the `clean-local` scripts remove only project-owned containers, volumes, network, and application image tags for a reproducible fresh start.
 
 ECS Service-based execution was also explored for the long-running Order Service workload. MiniStack successfully created and initially ran the service task, but did not reproduce ECS task replacement after the task was manually stopped. This is treated as a local-emulation limitation rather than validated ECS reconciliation behavior.
 
