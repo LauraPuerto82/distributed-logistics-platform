@@ -25,7 +25,7 @@ try {
     $env:AWS_REGION = "eu-west-1"
 
     $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $RepoRoot = Split-Path -Parent $ScriptDir
+    $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 
     $DockerComposeFile = Join-Path `
         $RepoRoot `

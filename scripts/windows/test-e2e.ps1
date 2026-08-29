@@ -7,12 +7,12 @@ Creates a shipment through Order Service and waits for the asynchronous
 event flow to produce RouteCalculated and ETAPredicted events in the
 Routing and Prediction transactional outboxes.
 
-The local environment must already be running through deploy-local.ps1.
+The local environment must already be running through scripts/windows/deploy-local.ps1.
 
 .PREREQUISITES
 - PowerShell
 - Docker
-- The local platform running via deploy-local.ps1
+- The local platform running via scripts/windows/deploy-local.ps1
 #>
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +34,7 @@ try {
         Out-Null
 }
 catch {
-    throw "Local deployment is not available. Run .\scripts\deploy-local.ps1 before executing the end-to-end test."
+    throw "Local deployment is not available. Run .\scripts\windows\deploy-local.ps1 before executing the end-to-end test."
 }
 
 Write-Host "Local deployment is available."

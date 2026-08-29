@@ -33,7 +33,7 @@ $env:AWS_SECRET_ACCESS_KEY = "test"
 $env:AWS_DEFAULT_REGION = "eu-west-1"
 
 try {
-    $RepoRoot = Split-Path -Parent $PSScriptRoot
+    $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
     $MiniStackEndpoint = "http://localhost:4566"
     # MiniStack's repositoryUri mimics AWS's ECR hostname format, but that
